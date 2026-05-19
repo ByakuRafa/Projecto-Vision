@@ -19,10 +19,15 @@ app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 class CalibracaoData(BaseModel):
     arquivos: List[str]
     plano: List[dict] 
-    cx: float
-    cy: float
-    raio: float
-    luzes: List[dict] # Lista de {px, py} para cada imagem
+    # Dependendo de como a sua função calcVetorLuz retorna no JS (se é array [x,y,z] ou objeto {x,y,z}), 
+    # deixamos como Any ou List[dict] para o FastAPI não chiar na conversão.
+    vetores_luz: List[Any] 
+    largura_mm: float
+    altura_mm: float
+    metodo_depth: str
+    suavizar_normais: bool # Lista de {px, py} para cada imagem
+
+
 
 @app.get("/")
 async def read_index():
@@ -39,20 +44,25 @@ async def upload_imagens(imagens: List[UploadFile] = File(...)):
     return {"arquivos": arquivos_salvos}
 
 @app.post("/processar")
-async def processar_dados(dados: CalibracaoData):
-    # 1. Calcular os 4 vetores de luz usando a função do cv_core
-    vetores_luz = []
-    for luz in dados.luzes:
-        v = cv_core.calcular_vetor_luz(dados.cx, dados.cy, dados.raio, luz['px'], luz['py'])
-        vetores_luz.append(v)
+async def processar_dados(dados: ProcessamentoData):
     
-    # 2. Preparar caminhos absolutos das imagens
+    # 1. Preparar caminhos absolutos das imagens
     caminhos_imagens = [f"uploads/{arquivo}" for arquivo in dados.arquivos]
     
-    # 3. Chamar o processamento pesado de CV
-    normal_img, depth_img, albedo_img = cv_core.processar_mapas(caminhos_imagens, vetores_luz, "static", dados.plano)
+    # 2. Chamar o processamento pesado de CV
+    # Agora passamos os vetores de luz diretos do frontend e as novas configurações
+    normal_img, depth_img, albedo_img = cv_core.processar_mapas(
+        imagens=caminhos_imagens, 
+        vetores_luz=dados.vetores_luz, 
+        diretorio_saida="static", 
+        plano=dados.plano,
+        largura_mm=dados.largura_mm,
+        altura_mm=dados.altura_mm,
+        metodo_depth=dados.metodo_depth,
+        suavizar_normais=dados.suavizar_normais
+    )
     
-    # 4. Retornar os caminhos para o frontend visualizar
+    # 3. Retornar os caminhos para o frontend atualizar as tags <img>
     return {
         "status": "sucesso",
         "normal_url": f"/static/{normal_img}",

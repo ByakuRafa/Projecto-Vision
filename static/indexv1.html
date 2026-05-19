@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <title>Auditoria de Asfalto - Calibração CV</title>
+    <style>
+        body { font-family: sans-serif; background: #1e1e2e; color: #cdd6f4; text-align: center; }
+        canvas { border: 2px solid #89b4fa; cursor: crosshair; margin-top: 10px; max-width: 800px;}
+        .painel { margin: 20px auto; padding: 15px; background: #313244; border-radius: 8px; max-width: 800px; }
+        button, input::file-selector-button { padding: 10px 20px; background: #a6e3a1; color: #11111b; border: none; border-radius: 4px; cursor: pointer; font-weight: bold;}
+        .resultados img { width: 45%; margin: 10px; border: 2px solid #a6e3a1; }
+        #instrucao { color: #f9e2af; }
+    </style>
+</head>
+<body>
+
+    <h1>Auditoria Fotométrica & Retificação</h1>
+    
+    <div class="painel" id="painelUpload">
+        <p>Selecione as 4 fotos do asfalto (com a esfera e a folha de referência visíveis):</p>
+        <input type="file" id="inputImagens" multiple accept="image/*">
+        <button onclick="enviarImagens()">Fazer Upload</button>
+    </div>
+
+    <div class="painel" id="painelCalibracao" style="display:none;">
+        <h3 id="instrucao">Passo 1: Clique nos 4 cantos da folha de papel/tapete (0/4)</h3>
+        <p>Imagem atual: <span id="lblImgAtual">1</span>/4</p>
+        <canvas id="meuCanvas"></canvas>
+    </div>
+
+    <div class="painel" id="painelResultados" style="display:none;">
+        <h3>Resultados do Processamento (Visão Retificada)</h3>
+        <div class="resultados">
+            <div>
+                <p>Normal Map (Visão de Topo)</p>
+                <img id="imgNormal" src="">
+            </div>
+            <div>
+                <p>Depth Map (Profundidade Real)</p>
+                <img id="imgDepth" src="">
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const canvas = document.getElementById('meuCanvas');
+        const ctx = canvas.getContext('2d');
+        let imgObj = new Image();
+        
+        let arquivos = [];
+        let indiceAtual = 0;
+        let estado = 'AguardandoPlano'; // Novo estado inicial!
+        
+        // Adicionamos o array 'plano' no payload
+        let payload = { arquivos: [], plano: [], cx: 0, cy: 0, raio: 0, luzes: [] };
+
+        async function enviarImagens() {
+            const input = document.getElementById('inputImagens');
+            if(input.files.length !== 4) return alert("Selecione exatamente 4 imagens.");
+            
+            const formData = new FormData();
+            for(let i=0; i<4; i++) formData.append('imagens', input.files[i]);
+
+            const res = await fetch('/upload_imagens', { method: 'POST', body: formData });
+            const data = await res.json();
+            
+            arquivos = data.arquivos;
+            payload.arquivos = arquivos;
+            
+            document.getElementById('painelUpload').style.display = 'none';
+            document.getElementById('painelCalibracao').style.display = 'block';
+            carregarImagemNoCanvas();
+        }
+
+        function carregarImagemNoCanvas() {
+            imgObj.src = `/uploads/${arquivos[indiceAtual]}`;
+            imgObj.onload = () => {
+                canvas.width = imgObj.width;
+                canvas.height = imgObj.height;
+                desenharCanvas();
+            };
+        }
+
+        function desenharCanvas() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.drawImage(imgObj, 0, 0);
+            
+            // Desenha o polígono do plano de referência
+            if(payload.plano.length > 0) {
+                ctx.strokeStyle = '#f9e2af'; ctx.lineWidth = 2; ctx.beginPath();
+                ctx.moveTo(payload.plano.x, payload.plano.y);
+                for(let i=1; i<payload.plano.length; i++) ctx.lineTo(payload.plano[i].x, payload.plano[i].y);
+                if(payload.plano.length === 4) ctx.closePath();
+                ctx.stroke();
+                
+                ctx.fillStyle = '#f9e2af';
+                for(let pt of payload.plano) {
+                    ctx.beginPath(); ctx.arc(pt.x, pt.y, 5, 0, Math.PI*2); ctx.fill();
+                }
+            }
+
+            // Desenha a esfera
+            if(estado !== 'AguardandoPlano' && estado !== 'AguardandoCentro') {
+                ctx.strokeStyle = 'red'; ctx.lineWidth = 2;
+                ctx.beginPath(); 
+                ctx.arc(payload.cx, payload.cy, payload.raio > 0 ? payload.raio : 2, 0, Math.PI*2); 
+                ctx.stroke();
+            }
+        }
+
+        canvas.addEventListener('mousedown', (e) => {
+            const rect = canvas.getBoundingClientRect();
+            const scaleX = canvas.width / rect.width;
+            const scaleY = canvas.height / rect.height;
+            const x = (e.clientX - rect.left) * scaleX;
+            const y = (e.clientY - rect.top) * scaleY;
+
+            if (estado === 'AguardandoPlano') {
+                payload.plano.push({ x: x, y: y });
+                if (payload.plano.length === 4) {
+                    estado = 'AguardandoCentro';
+                    document.getElementById('instrucao').innerHTML = "Passo 2: Clique no <b>CENTRO</b> da esfera cromada";
+                } else {
+                    document.getElementById('instrucao').innerHTML = `Passo 1: Clique nos 4 cantos da folha/referência (${payload.plano.length}/4)`;
+                }
+                desenharCanvas();
+
+            } else if (estado === 'AguardandoCentro') {
+                payload.cx = x; payload.cy = y;
+                document.getElementById('instrucao').innerHTML = "Passo 3: Clique na <b>BORDA LIMITROFE</b> da esfera";
+                estado = 'AguardandoBorda';
+                desenharCanvas();
+                
+            } else if (estado === 'AguardandoBorda') {
+                payload.raio = Math.sqrt(Math.pow(x - payload.cx, 2) + Math.pow(y - payload.cy, 2));
+                document.getElementById('instrucao').innerHTML = "Passo 4: Clique no <b>PONTO DE LUZ (reflexo)</b> nesta foto";
+                estado = 'AguardandoLuz';
+                desenharCanvas();
+
+            } else if (estado === 'AguardandoLuz') {
+                payload.luzes.push({ px: x, py: y });
+                
+                indiceAtual++;
+                if(indiceAtual < 4) {
+                    document.getElementById('lblImgAtual').innerText = indiceAtual + 1;
+                    document.getElementById('instrucao').innerHTML = "Clique no <b>PONTO DE LUZ</b> desta próxima foto";
+                    estado = 'AguardandoLuz'; 
+                    carregarImagemNoCanvas(); 
+                } else {
+                    document.getElementById('instrucao').innerHTML = "Processando Matrizes e Retificando Perspectiva... Aguarde.";
+                    processarNoBackend();
+                }
+            }
+        });
+
+        async function processarNoBackend() {
+            const res = await fetch('/processar', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+            const data = await res.json();
+            
+            document.getElementById('painelCalibracao').style.display = 'none';
+            document.getElementById('painelResultados').style.display = 'block';
+            document.getElementById('imgNormal').src = data.normal_url + '?t=' + new Date().getTime();
+            document.getElementById('imgDepth').src = data.depth_url + '?t=' + new Date().getTime();
+        }
+    </script>
+</body>
+</html>
