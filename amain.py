@@ -44,7 +44,7 @@ async def upload_imagens(imagens: List[UploadFile] = File(...)):
     return {"arquivos": arquivos_salvos}
 
 @app.post("/processar")
-async def processar_dados(dados: ProcessamentoData):
+async def processar_dados(dados: CalibracaoData):
     
     # 1. Preparar caminhos absolutos das imagens
     caminhos_imagens = [f"uploads/{arquivo}" for arquivo in dados.arquivos]
