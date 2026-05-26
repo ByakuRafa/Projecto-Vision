@@ -336,7 +336,7 @@ if __name__ == "__main__":
     CONFIG["workbench"]["volume_z_m"]  = args.vol_z
     CONFIG["workbench"]["offset_x_m"]  = args.cam_x
     CONFIG["workbench"]["offset_y_m"]  = args.cam_y
-    CONFIG["workbench"]["offset_z_m"]  = args.cam_z
+    CONFIG["workbench"]["offset_z_m"]  = 10
     CONFIG["floor_percentile"]         = args.floor_pct
     CONFIG["object_threshold_m"]       = args.threshold
     CONFIG["min_area_px"]              = args.min_area

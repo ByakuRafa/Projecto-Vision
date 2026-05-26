@@ -1,17 +1,15 @@
 """
-main.py — Servidor FastAPI para o pipeline de Estéreo Fotométrico.
+amain.py — Servidor FastAPI · Modo Blender (câmara ortogonal fixa)
+
+Diferenças em relação à versão anterior:
+  • CalibracaoData não tem mais o campo `plano` (4 cantos manuais).
+  • Novos campos: wb_larg_mm, wb_prof_mm, camera_h_mm, focal_mm, sensor_w_mm.
+  • processar_mapas() é chamado com camera_ortogonal=True →
+    ROI auto-calculada, homografia/rotação omitidas.
 
 Execução:
     pip install fastapi uvicorn python-multipart
-    uvicorn main:app --reload --port 8000
-
-Estrutura de pastas esperada:
-    main.py
-    cv_core.py
-    static/
-        index.html       ← copie o index.html para cá
-    uploads/             ← criada automaticamente
-    resultados/          ← criada automaticamente
+    uvicorn amain:app --reload --port 8000
 """
 
 import asyncio
@@ -30,56 +28,47 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
 # ──────────────────────────────────────────────────────────────
-# CONFIGURAÇÃO
-# ──────────────────────────────────────────────────────────────
-
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("photostereo")
 
 DIR_STATIC     = Path("static")
 DIR_UPLOADS    = Path("uploads")
-DIR_RESULTADOS = Path("static")   # Resultados servidos via /static
 
-for d in (DIR_STATIC, DIR_UPLOADS, DIR_RESULTADOS):
+for d in (DIR_STATIC, DIR_UPLOADS):
     d.mkdir(exist_ok=True)
 
-# Pool de threads para não bloquear o event loop durante o processamento CV.
-# max_workers=2: evita sobrecarga de RAM em hardware limitado.
 _executor = ThreadPoolExecutor(max_workers=2)
-
-app = FastAPI(title="PhotoStereo Audit", version="3.0")
+app       = FastAPI(title="PhotoStereo Blender", version="4.0")
 
 app.mount("/static",  StaticFiles(directory=DIR_STATIC),  name="static")
 app.mount("/uploads", StaticFiles(directory=DIR_UPLOADS), name="uploads")
 
 
 # ──────────────────────────────────────────────────────────────
-# MODELOS PYDANTIC
+# MODELOS
 # ──────────────────────────────────────────────────────────────
-
-class PontoPlano(BaseModel):
-    """Coordenada de um canto do plano de referência em pixels."""
-    x: float
-    y: float
-
 
 class CalibracaoData(BaseModel):
     """
-    Payload enviado pelo frontend após a calibração.
-
-    vetores_luz: lista de 4 vetores [Lx, Ly, Lz], pré-calculados pelo
-                 frontend a partir da geometria conhecida (h_mm, d_mm, ângulo).
-                 Cada vetor já chega normalizado — cv_core renormaliza por
-                 segurança de qualquer forma.
+    Payload do frontend.
+    Sem `plano`: a ROI é calculada automaticamente dos parâmetros da câmara.
     """
     arquivos:        List[str]
-    plano:           List[PontoPlano]
-    vetores_luz:     List[List[float]]          # BUG #1 CORRIGIDO: era List[Any] sem import
-    largura_mm:      float  = Field(210.0, gt=0)
-    altura_mm:       float  = Field(297.0, gt=0)
-    metodo_depth:    str    = "poisson"
-    suavizar_normais: bool  = False
+    vetores_luz:     List[List[float]]
+
+    # ── Câmara Blender ───────────────────────────────────────
+    focal_mm:        float = Field(50.0,  gt=0, description="Focal length (mm)")
+    sensor_w_mm:     float = Field(36.0,  gt=0, description="Sensor width (mm)")
+    camera_h_mm:     float = Field(1000.0,gt=0, description="Altura da câmara acima da bancada (mm)")
+
+    # ── Bancada ──────────────────────────────────────────────
+    wb_larg_mm:      float = Field(1000.0, gt=0, description="Largura da bancada (mm)")
+    wb_prof_mm:      float = Field(600.0,  gt=0, description="Profundidade da bancada (mm)")
+
+    # ── Opções de processamento ──────────────────────────────
+    metodo_depth:    str  = "poisson"
+    suavizar_normais: bool = False
 
     @field_validator("arquivos")
     @classmethod
@@ -98,13 +87,6 @@ class CalibracaoData(BaseModel):
                 raise ValueError(f"Vetor {i} deve ter 3 componentes [Lx, Ly, Lz].")
         return v
 
-    @field_validator("plano")
-    @classmethod
-    def validar_plano(cls, v):
-        if len(v) != 4:
-            raise ValueError(f"Esperado 4 pontos do plano, recebido {len(v)}.")
-        return v
-
     @field_validator("metodo_depth")
     @classmethod
     def validar_metodo(cls, v):
@@ -119,7 +101,6 @@ class CalibracaoData(BaseModel):
 
 @app.get("/")
 async def read_index():
-    """Serve a interface HTML principal."""
     caminho = DIR_STATIC / "index.html"
     if not caminho.exists():
         raise HTTPException(404, detail="index.html não encontrado em static/")
@@ -128,28 +109,19 @@ async def read_index():
 
 @app.post("/upload_imagens")
 async def upload_imagens(imagens: List[UploadFile] = File(...)):
-    """
-    Recebe as 4 imagens, salva com nomes únicos e devolve os nomes.
-
-    BUG #3 CORRIGIDO: a versão anterior salvava com img.filename original,
-    causando colisão entre sessões com fotos de mesmo nome (ex: IMG_0001.jpg).
-    Agora cada arquivo recebe um UUID como prefixo, garantindo unicidade.
-    """
+    """Recebe as 4 imagens, salva com UUID e devolve os nomes."""
     if len(imagens) != 4:
         raise HTTPException(400, detail=f"Envie exatamente 4 imagens. Recebido: {len(imagens)}.")
 
     arquivos_salvos = []
     for img in imagens:
-        # Sanitiza a extensão (mantém somente a extensão original)
         extensao   = Path(img.filename).suffix.lower() or ".jpg"
         nome_unico = f"{uuid.uuid4().hex}{extensao}"
         caminho    = DIR_UPLOADS / nome_unico
-
         with caminho.open("wb") as buf:
             shutil.copyfileobj(img.file, buf)
-
         arquivos_salvos.append(nome_unico)
-        log.info(f"Upload salvo: {nome_unico} (original: {img.filename})")
+        log.info(f"Upload: {nome_unico}  (original: {img.filename})")
 
     return {"arquivos": arquivos_salvos}
 
@@ -157,58 +129,49 @@ async def upload_imagens(imagens: List[UploadFile] = File(...)):
 @app.post("/processar")
 async def processar_dados(dados: CalibracaoData):
     """
-    Executa o pipeline de Estéreo Fotométrico e devolve URLs dos resultados.
-
-    BUG #4 CORRIGIDO: processar_mapas() é CPU-bound (numpy/opencv).
-    Rodá-lo diretamente em async def bloqueia o event loop inteiro.
-    run_in_executor() delega para um ThreadPoolExecutor e mantém o
-    servidor responsivo durante o processamento.
+    Executa o pipeline de Estéreo Fotométrico no modo Blender.
+    ROI calculada automaticamente; sem homografia.
     """
-    # Verifica se todos os arquivos existem antes de iniciar
     caminhos = []
     for nome in dados.arquivos:
         p = DIR_UPLOADS / nome
         if not p.exists():
-            raise HTTPException(404, detail=f"Arquivo não encontrado: {nome}. "
-                                            "Faça o upload novamente.")
+            raise HTTPException(404, detail=f"Arquivo não encontrado: {nome}. Faça o upload novamente.")
         caminhos.append(str(p))
 
-    # Converte PontoPlano → dict para cv_core (que espera List[dict])
-    plano_dicts = [{"x": pt.x, "y": pt.y} for pt in dados.plano]
-
-    # BUG #2 CORRIGIDO:
-    #   Versão anterior: imagens=, plano=   ← nomes errados → TypeError
-    #   Versão correta:  caminhos_imagens=, plano_coords=
     def _executar_cv():
         return cv_core.processar_mapas(
             caminhos_imagens = caminhos,
             vetores_luz      = dados.vetores_luz,
-            diretorio_saida  = str(DIR_RESULTADOS),
-            plano_coords     = plano_dicts,
-            largura_mm       = dados.largura_mm,
-            altura_mm        = dados.altura_mm,
+            diretorio_saida  = str(DIR_STATIC),
+            # ── Modo Blender ────────────────────────────────
+            camera_ortogonal = True,
+            wb_larg_mm       = dados.wb_larg_mm,
+            wb_prof_mm       = dados.wb_prof_mm,
+            camera_h_mm      = dados.camera_h_mm,
+            focal_mm         = dados.focal_mm,
+            sensor_w_mm      = dados.sensor_w_mm,
+            # ── Opções ──────────────────────────────────────
             metodo_depth     = dados.metodo_depth,
             suavizar_normais = dados.suavizar_normais,
         )
 
-    log.info(f"Iniciando processamento CV | método: {dados.metodo_depth} | "
-             f"ref: {dados.largura_mm}×{dados.altura_mm}mm")
+    log.info(f"Processando | método={dados.metodo_depth} | "
+             f"câmara h={dados.camera_h_mm}mm f={dados.focal_mm}mm | "
+             f"bancada {dados.wb_larg_mm}×{dados.wb_prof_mm}mm")
 
     try:
         loop = asyncio.get_event_loop()
-        normal_img, depth_img, albedo_img = await loop.run_in_executor(
-            _executor, _executar_cv
-        )
+        normal_img, depth_img, albedo_img = await loop.run_in_executor(_executor, _executar_cv)
     except FileNotFoundError as e:
         raise HTTPException(404, detail=str(e))
     except ValueError as e:
         raise HTTPException(422, detail=str(e))
     except Exception as e:
         log.exception("Erro no pipeline CV")
-        raise HTTPException(500, detail=f"Erro interno no processamento: {e}")
+        raise HTTPException(500, detail=f"Erro interno: {e}")
 
-    log.info("Processamento concluído com sucesso.")
-
+    log.info("Processamento concluído.")
     return {
         "status":     "sucesso",
         "normal_url": f"/static/{normal_img}",
@@ -219,5 +182,4 @@ async def processar_dados(dados: CalibracaoData):
 
 @app.get("/health")
 async def health():
-    """Endpoint de saúde — útil para monitorar se o servidor está de pé."""
     return {"status": "ok"}

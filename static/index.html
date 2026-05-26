@@ -1,194 +1,191 @@
 <!DOCTYPE html>
 <html lang="pt-BR">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>PhotoStereo — Geometria Fixa</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@300;400;500&display=swap" rel="stylesheet">
-    <style>
-        :root {
-            --bg:       #0d0f14;
-            --surf:     #151820;
-            --surf2:    #1c2030;
-            --border:   #2a3045;
-            --bhi:      #3d4f6e;
-            --text:     #c8d3e8;
-            --dim:      #6b7a99;
-            --acc:      #4a9eff;
-            --grn:      #3ddc97;
-            --warn:     #f4b942;
-            --danger:   #f46e6e;
-            --mono:     'IBM Plex Mono', monospace;
-            --sans:     'IBM Plex Sans', sans-serif;
-        }
-        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PhotoStereo — Blender Mode</title>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@300;400;500&display=swap" rel="stylesheet">
+<style>
+:root {
+    --bg:    #0d0f14; --surf:  #151820; --surf2: #1c2030;
+    --brd:   #2a3045; --bhi:   #3d4f6e; --text:  #c8d3e8;
+    --dim:   #6b7a99; --acc:   #4a9eff; --grn:   #3ddc97;
+    --warn:  #f4b942; --danger:#f46e6e; --purp:  #a78bfa;
+    --mono: 'IBM Plex Mono', monospace;
+    --sans: 'IBM Plex Sans', sans-serif;
+}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{font-family:var(--sans);background:var(--bg);color:var(--text);
+     min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:24px 16px 60px}
 
-        body {
-            font-family: var(--sans);
-            background: var(--bg);
-            color: var(--text);
-            min-height: 100vh;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            padding: 24px 16px 60px;
-        }
+header{width:100%;max-width:960px;display:flex;align-items:baseline;gap:16px;
+       margin-bottom:24px;padding-bottom:14px;border-bottom:1px solid var(--brd)}
+header h1{font-family:var(--mono);font-size:1rem;font-weight:600;color:var(--acc);letter-spacing:.05em}
+header span{font-family:var(--mono);font-size:.7rem;color:var(--dim);letter-spacing:.08em}
 
-        header {
-            width: 100%; max-width: 900px;
-            display: flex; align-items: baseline; gap: 16px;
-            margin-bottom: 28px; padding-bottom: 16px;
-            border-bottom: 1px solid var(--border);
-        }
-        header h1 { font-family: var(--mono); font-size: 1.05rem; font-weight: 600; color: var(--acc); letter-spacing: 0.05em; }
-        header span { font-family: var(--mono); font-size: 0.72rem; color: var(--dim); letter-spacing: 0.08em; }
+/* STEPPER */
+#stepper{display:flex;max-width:960px;width:100%;margin-bottom:18px}
+.step{flex:1;text-align:center;padding:8px 4px;font-family:var(--mono);font-size:.63rem;
+      color:var(--dim);border-bottom:2px solid var(--brd);transition:color .2s,border-color .2s;letter-spacing:.04em}
+.step .sn{display:block;font-size:.52rem;margin-bottom:2px;opacity:.4}
+.step.ativo{color:var(--acc);border-color:var(--acc)}
+.step.ok{color:var(--grn);border-color:var(--grn)}
 
-        /* STEPPER */
-        #stepper { display: flex; max-width: 900px; width: 100%; margin-bottom: 20px; }
-        .step {
-            flex: 1; text-align: center; padding: 9px 4px;
-            font-family: var(--mono); font-size: 0.66rem; color: var(--dim);
-            border-bottom: 2px solid var(--border);
-            transition: color .2s, border-color .2s; letter-spacing: .04em;
-        }
-        .step .sn { display: block; font-size: 0.56rem; margin-bottom: 2px; opacity: .45; }
-        .step.ativo   { color: var(--acc); border-color: var(--acc); }
-        .step.ok      { color: var(--grn); border-color: var(--grn); }
+.painel{width:100%;max-width:960px;background:var(--surf);border:1px solid var(--brd);
+        border-radius:6px;padding:20px;margin-bottom:14px}
+.ptitle{font-family:var(--mono);font-size:.68rem;color:var(--dim);letter-spacing:.1em;
+        text-transform:uppercase;margin-bottom:14px}
+.sec{font-family:var(--mono);font-size:.58rem;color:var(--dim);letter-spacing:.1em;
+     text-transform:uppercase;margin:18px 0 8px;padding-bottom:5px;border-bottom:1px solid var(--brd)}
 
-        /* PAINEL */
-        .painel {
-            width: 100%; max-width: 900px;
-            background: var(--surf); border: 1px solid var(--border);
-            border-radius: 6px; padding: 22px; margin-bottom: 14px;
-        }
-        .ptitle { font-family: var(--mono); font-size: .72rem; color: var(--dim); letter-spacing: .1em; text-transform: uppercase; margin-bottom: 16px; }
+/* ───────────────────────────────────────────────
+   CARDS DE DIREÇÃO (4 slots de imagem + bússola)
+─────────────────────────────────────────────── */
+.dir-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}
 
-        /* UPLOAD ZONE */
-        #zonaUpload {
-            border: 1.5px dashed var(--bhi); border-radius: 4px;
-            padding: 30px 20px; text-align: center; cursor: pointer;
-            transition: border-color .2s, background .2s; position: relative;
-        }
-        #zonaUpload:hover, #zonaUpload.hover { border-color: var(--acc); background: rgba(74,158,255,.04); }
-        #zonaUpload input[type="file"] { position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; }
-        #zonaUpload .icon { font-size: 1.8rem; display: block; opacity: .35; margin-bottom: 8px; }
-        #zonaUpload p { font-size: .84rem; color: var(--dim); }
-        #fileCount { display: block; margin-top: 6px; font-family: var(--mono); font-size: .78rem; color: var(--grn); }
+.dir-card{
+    background:var(--surf2);border:1.5px solid var(--brd);border-radius:8px;
+    display:flex;flex-direction:column;align-items:center;gap:0;overflow:hidden;
+    transition:border-color .2s,background .15s;position:relative;
+}
+.dir-card.has-img   {border-color:var(--grn)}
+.dir-card.drag-over {border-color:var(--acc);background:rgba(74,158,255,.06)}
+.dir-card.drag-over * {pointer-events:none}
 
-        /* GEO GRID */
-        .geo-grid { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 12px; margin-top: 16px; }
-        .geo-item label { display: block; font-family: var(--mono); font-size: .65rem; color: var(--dim); margin-bottom: 5px; letter-spacing: .06em; }
-        .geo-item input, .geo-item select {
-            width: 100%; background: var(--surf2); border: 1px solid var(--border);
-            color: var(--text); font-family: var(--mono); font-size: .82rem;
-            padding: 7px 9px; border-radius: 4px; outline: none;
-            transition: border-color .15s;
-        }
-        .geo-item input:focus, .geo-item select:focus { border-color: var(--acc); }
-        .geo-toggle { display: flex; align-items: center; gap: 7px; padding-top: 20px; }
-        .geo-toggle input[type="checkbox"] { accent-color: var(--acc); }
-        .geo-toggle span { font-size: .8rem; }
+/* thumbnail */
+.card-thumb{
+    width:100%;aspect-ratio:4/3;background:#0a0c10;
+    display:flex;align-items:center;justify-content:center;
+    overflow:hidden;position:relative;cursor:pointer;
+}
+.card-thumb img{width:100%;height:100%;object-fit:cover;display:none}
+.card-thumb .thumb-placeholder{
+    display:flex;flex-direction:column;align-items:center;gap:6px;
+    font-family:var(--mono);font-size:.62rem;color:var(--dim);
+}
+.card-thumb .thumb-placeholder .add-icon{font-size:1.4rem;opacity:.3}
+.card-thumb:hover .thumb-placeholder{color:var(--acc)}
+.card-thumb:hover .add-icon{opacity:.6}
+.card-thumb input[type=file]{position:absolute;inset:0;opacity:0;cursor:pointer;width:100%;height:100%}
 
-        /* CARDS DAS 4 IMAGENS */
-        .cards-luz { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-top: 16px; }
-        .card-luz {
-            background: var(--surf2); border: 1px solid var(--border);
-            border-radius: 6px; padding: 12px; text-align: center;
-        }
-        .card-luz .clabel {
-            font-family: var(--mono); font-size: .62rem; color: var(--dim);
-            letter-spacing: .06em; margin-bottom: 10px; display: block;
-        }
-        /* Compass SVG */
-        .compass-wrap { position: relative; display: inline-block; cursor: pointer; }
-        .compass-wrap svg { display: block; }
-        .compass-dot { transition: cx .15s, cy .15s; }
+/* clear button */
+.clear-btn{
+    position:absolute;top:5px;right:5px;
+    background:rgba(13,15,20,.75);border:1px solid var(--brd);
+    color:var(--dim);font-size:.65rem;font-family:var(--mono);
+    padding:2px 6px;border-radius:3px;cursor:pointer;display:none;
+    transition:color .15s,border-color .15s;z-index:2;
+}
+.clear-btn:hover{color:var(--danger);border-color:var(--danger)}
+.dir-card.has-img .clear-btn{display:block}
 
-        .dir-presets { display: flex; flex-wrap: wrap; gap: 4px; justify-content: center; margin-top: 8px; }
-        .dir-btn {
-            font-family: var(--mono); font-size: .6rem; padding: 3px 8px;
-            background: transparent; border: 1px solid var(--bhi); color: var(--dim);
-            border-radius: 3px; cursor: pointer; transition: border-color .15s, color .15s;
-        }
-        .dir-btn:hover { border-color: var(--acc); color: var(--acc); }
-        .dir-btn.sel   { border-color: var(--warn); color: var(--warn); background: rgba(244,185,66,.08); }
+/* card body */
+.card-body{width:100%;padding:10px 10px 12px;display:flex;flex-direction:column;align-items:center;gap:8px}
 
-        .angulo-val { font-family: var(--mono); font-size: .7rem; color: var(--warn); margin-top: 6px; }
+/* bússola compacta */
+.compass-wrap{cursor:pointer;position:relative}
+.compass-wrap svg{display:block}
 
-        /* DIAGRAM GEO */
-        .geo-diagram {
-            background: var(--surf2); border: 1px solid var(--border);
-            border-radius: 4px; padding: 12px; margin-top: 14px;
-            display: flex; align-items: center; gap: 16px;
-        }
-        .geo-diagram svg { flex-shrink: 0; }
-        .geo-diagram p { font-size: .78rem; color: var(--dim); line-height: 1.5; }
-        .geo-diagram strong { color: var(--text); }
+.card-dir-label{
+    font-family:var(--mono);font-size:.62rem;color:var(--dim);
+    letter-spacing:.07em;text-align:center
+}
+.card-dir-label strong{color:var(--warn);font-size:.75rem}
 
-        /* BTN */
-        .btn {
-            font-family: var(--mono); font-size: .78rem; font-weight: 600;
-            letter-spacing: .06em; padding: 9px 20px; border: 1.5px solid;
-            border-radius: 4px; cursor: pointer; transition: opacity .15s, transform .1s;
-        }
-        .btn:active { transform: scale(.97); }
-        .btn-primary { background: var(--acc); border-color: var(--acc); color: #0d0f14; }
-        .btn-ghost   { background: transparent; border-color: var(--bhi); color: var(--dim); }
-        .btn-ghost:hover { border-color: var(--warn); color: var(--warn); }
-        .btn:disabled { opacity: .3; cursor: not-allowed; }
-        .btn-row { display: flex; gap: 10px; margin-top: 14px; flex-wrap: wrap; }
+/* presets */
+.presets{display:flex;gap:4px;flex-wrap:wrap;justify-content:center}
+.pbtn{
+    font-family:var(--mono);font-size:.58rem;padding:2px 7px;
+    background:transparent;border:1px solid var(--bhi);color:var(--dim);
+    border-radius:3px;cursor:pointer;transition:border-color .15s,color .15s
+}
+.pbtn:hover{border-color:var(--acc);color:var(--acc)}
+.pbtn.sel{border-color:var(--warn);color:var(--warn);background:rgba(244,185,66,.08)}
 
-        /* CANVAS */
-        #wrapCanvas { position: relative; margin-top: 14px; border: 1px solid var(--border); border-radius: 4px; overflow: hidden; line-height: 0; }
-        #meuCanvas  { cursor: crosshair; display: block; max-width: 100%; height: auto; }
+/* filename badge */
+.fname{
+    font-family:var(--mono);font-size:.57rem;color:var(--grn);
+    text-align:center;padding:0 4px;word-break:break-all;
+    max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:none
+}
+.dir-card.has-img .fname{display:block}
 
-        /* INSTRUÇÃO */
-        #instrucao {
-            font-family: var(--mono); font-size: .8rem; color: var(--warn);
-            background: rgba(244,185,66,.08); border: 1px solid rgba(244,185,66,.2);
-            border-radius: 4px; padding: 9px 13px; margin-bottom: 8px;
-        }
-        #instrucao strong { color: #fff; }
+/* ──────────────────────────
+   PARÂMETROS (câmara + luz)
+────────────────────────── */
+.params-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+.params-grid2{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:10px}
+.fld label{display:block;font-family:var(--mono);font-size:.6rem;color:var(--dim);margin-bottom:4px;letter-spacing:.06em}
+.fld input,.fld select{
+    width:100%;background:var(--surf2);border:1px solid var(--brd);
+    color:var(--text);font-family:var(--mono);font-size:.8rem;
+    padding:6px 8px;border-radius:4px;outline:none;transition:border-color .15s
+}
+.fld input:focus,.fld select:focus{border-color:var(--acc)}
+.chk{display:flex;align-items:center;gap:7px;padding-top:18px}
+.chk input{accent-color:var(--acc)}
+.chk span{font-size:.78rem}
 
-        /* BARRA */
-        #barraProgresso { height: 2px; background: var(--border); border-radius: 2px; margin-top: 14px; overflow: hidden; }
-        #barraFill { height: 100%; background: var(--grn); transition: width .4s ease; }
+/* ROI badge */
+#roiBadge{
+    display:none;margin-top:10px;font-family:var(--mono);font-size:.68rem;
+    color:var(--grn);background:rgba(61,220,151,.07);
+    border:1px solid rgba(61,220,151,.2);border-radius:4px;padding:7px 11px
+}
 
-        /* LOADING */
-        #loadingOverlay {
-            display: none; position: fixed; inset: 0;
-            background: rgba(13,15,20,.88); backdrop-filter: blur(4px);
-            z-index: 100; flex-direction: column; align-items: center; justify-content: center; gap: 16px;
-        }
-        #loadingOverlay.vis { display: flex; }
-        .spinner { width: 34px; height: 34px; border: 2px solid var(--border); border-top-color: var(--acc); border-radius: 50%; animation: spin .8s linear infinite; }
-        @keyframes spin { to { transform: rotate(360deg); } }
-        #loadingOverlay p { font-family: var(--mono); font-size: .78rem; color: var(--dim); }
+/* STATUS BAR dos 4 slots */
+#slotBar{
+    display:flex;gap:8px;align-items:center;padding:10px 0 2px;
+    font-family:var(--mono);font-size:.68rem;flex-wrap:wrap
+}
+.slot-dot{
+    display:inline-flex;align-items:center;gap:5px;
+    padding:3px 9px;border-radius:3px;border:1px solid var(--brd);
+    color:var(--dim);transition:all .2s
+}
+.slot-dot.ok{border-color:var(--grn);color:var(--grn);background:rgba(61,220,151,.07)}
 
-        /* RESULTADOS */
-        .res-grid { display: grid; grid-template-columns: repeat(3,1fr); gap: 14px; margin-top: 8px; }
-        .res-item { background: var(--surf2); border: 1px solid var(--border); border-radius: 4px; overflow: hidden; }
-        .res-item img { width: 100%; display: block; aspect-ratio: 1; object-fit: cover; }
-        .res-lbl { font-family: var(--mono); font-size: .63rem; color: var(--dim); padding: 7px 9px; letter-spacing: .06em; text-transform: uppercase; }
-        .res-lbl strong { display: block; color: var(--text); font-size: .76rem; margin-bottom: 2px; }
+/* BTN */
+.btn{font-family:var(--mono);font-size:.76rem;font-weight:600;letter-spacing:.06em;
+     padding:9px 20px;border:1.5px solid;border-radius:4px;cursor:pointer;
+     transition:opacity .15s,transform .1s}
+.btn:active{transform:scale(.97)}
+.btn-primary{background:var(--acc);border-color:var(--acc);color:#0d0f14}
+.btn-ghost{background:transparent;border-color:var(--bhi);color:var(--dim)}
+.btn-ghost:hover{border-color:var(--warn);color:var(--warn)}
+.btn:disabled{opacity:.3;cursor:not-allowed}
+.btn-row{display:flex;gap:10px;margin-top:16px;flex-wrap:wrap;align-items:center}
 
-        /* NOTIF */
-        #notif {
-            position: fixed; bottom: 22px; right: 22px;
-            background: var(--surf2); border: 1px solid var(--bhi);
-            border-radius: 4px; padding: 9px 14px;
-            font-family: var(--mono); font-size: .73rem; color: var(--danger);
-            transform: translateY(60px); opacity: 0; transition: transform .3s, opacity .3s; z-index: 200;
-        }
-        #notif.vis { transform: translateY(0); opacity: 1; }
+/* RESULTS */
+.res-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-top:8px}
+.res-item{background:var(--surf2);border:1px solid var(--brd);border-radius:4px;overflow:hidden}
+.res-item img{width:100%;display:block;aspect-ratio:1;object-fit:cover}
+.res-lbl{font-family:var(--mono);font-size:.6rem;color:var(--dim);padding:7px 9px;letter-spacing:.06em;text-transform:uppercase}
+.res-lbl strong{display:block;color:var(--text);font-size:.73rem;margin-bottom:2px}
 
-        @media (max-width: 650px) {
-            .geo-grid    { grid-template-columns: 1fr 1fr; }
-            .cards-luz   { grid-template-columns: 1fr 1fr; }
-            .res-grid    { grid-template-columns: 1fr; }
-        }
-    </style>
+/* LOADING */
+#loadingOverlay{display:none;position:fixed;inset:0;background:rgba(13,15,20,.9);
+    backdrop-filter:blur(4px);z-index:100;flex-direction:column;align-items:center;
+    justify-content:center;gap:16px}
+#loadingOverlay.vis{display:flex}
+.spinner{width:32px;height:32px;border:2px solid var(--brd);border-top-color:var(--acc);
+         border-radius:50%;animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+#loadingMsg{font-family:var(--mono);font-size:.75rem;color:var(--dim)}
+
+/* NOTIF */
+#notif{position:fixed;bottom:20px;right:20px;background:var(--surf2);
+       border:1px solid var(--bhi);border-radius:4px;padding:8px 13px;
+       font-family:var(--mono);font-size:.7rem;color:var(--danger);
+       transform:translateY(60px);opacity:0;transition:transform .3s,opacity .3s;z-index:200}
+#notif.vis{transform:translateY(0);opacity:1}
+
+@media(max-width:680px){
+    .dir-grid{grid-template-columns:1fr 1fr}
+    .params-grid,.params-grid2{grid-template-columns:1fr 1fr}
+    .res-grid{grid-template-columns:1fr}
+}
+</style>
 </head>
 <body>
 
@@ -196,135 +193,97 @@
 <div id="notif"></div>
 
 <header>
-    <h1>PHOTOSTEREO//AUDIT</h1>
-    <span>GEOMETRIA FIXA · SEM ESFERA · RETIFICAÇÃO POR HOMOGRAFIA · v3</span>
+    <h1>PHOTOSTEREO//BLENDER</h1>
+    <span>CÂMARA ORTOGONAL · ROI AUTO · ASSOCIAÇÃO VISUAL LUZ→IMAGEM · v4.1</span>
 </header>
 
 <div id="stepper">
-    <div class="step ativo" id="st0"><span class="sn">01</span>UPLOAD + SETUP</div>
-    <div class="step"       id="st1"><span class="sn">02</span>REFERÊNCIA</div>
-    <div class="step"       id="st2"><span class="sn">03</span>RESULTADO</div>
+    <div class="step ativo" id="st0"><span class="sn">01</span>SETUP + IMAGENS</div>
+    <div class="step"       id="st1"><span class="sn">02</span>RESULTADO</div>
 </div>
 
-<!-- ══════════════════════════════════════════
-     PAINEL 1 — UPLOAD + GEOMETRIA
-══════════════════════════════════════════ -->
-<div class="painel" id="painelUpload">
-    <p class="ptitle">// 01 · imagens + configuração do setup</p>
+<!-- ══════════════════════ PAINEL SETUP ══════════════════════ -->
+<div class="painel" id="painelSetup">
+    <p class="ptitle">// 01 · associar imagem a cada direção de luz</p>
 
-    <div id="zonaUpload">
-        <span class="icon">⬡</span>
-        <p>Arraste as 4 fotos (câmera estática, luz movida a cada foto)</p>
-        <p style="font-size:.72rem; margin-top:5px; color:var(--dim);">Aceita JPG, PNG — alta resolução recomendada.</p>
-        <span id="fileCount"></span>
-        <input type="file" id="inputImagens" multiple accept="image/*" onchange="onFileChange(this)">
+    <!-- 4 CARDS ────────────────────────────────────────────── -->
+    <div class="dir-grid" id="dirGrid"></div>
+
+    <!-- STATUS DOS 4 SLOTS -->
+    <div id="slotBar"></div>
+
+    <!-- PARÂMETROS DA CÂMARA ─────────────────────────────── -->
+    <p class="sec">câmara blender</p>
+    <div class="params-grid">
+        <div class="fld">
+            <label>FOCAL LENGTH (mm)</label>
+            <input type="number" id="cfgFocal"  value="50"   min="1"   max="1000" step="0.1" oninput="atualizarROI()">
+        </div>
+        <div class="fld">
+            <label>SENSOR WIDTH (mm)</label>
+            <input type="number" id="cfgSensor" value="36"   min="1"   max="200"  step="0.1" oninput="atualizarROI()">
+        </div>
+        <div class="fld">
+            <label>ALTURA CÂMARA (mm)</label>
+            <input type="number" id="cfgCamH"   value="1070" min="10"  max="10000" step="1"  oninput="atualizarROI()">
+        </div>
     </div>
 
-    <!-- Geometria da luz -->
-    <div class="geo-grid" style="margin-top:18px;">
-        <div class="geo-item">
-            <label>ALTURA DA LUZ (mm)</label>
-            <input type="number" id="cfgH" value="25" min="1" max="500" step="1">
+    <!-- PARÂMETROS DA BANCADA ────────────────────────────── -->
+    <p class="sec">bancada (área de trabalho)</p>
+    <div class="params-grid">
+        <div class="fld">
+            <label>LARGURA (mm)</label>
+            <input type="number" id="cfgWbLarg" value="1000" min="10" max="5000" step="1" oninput="atualizarROI()">
         </div>
-        <div class="geo-item">
-            <label>DISTÂNCIA HORIZONTAL (mm)</label>
+        <div class="fld">
+            <label>PROFUNDIDADE (mm)</label>
+            <input type="number" id="cfgWbProf" value="600"  min="10" max="5000" step="1" oninput="atualizarROI()">
+        </div>
+    </div>
+    <div id="roiBadge"></div>
+
+    <!-- PARÂMETROS DA LUZ ───────────────────────────────── -->
+    <p class="sec">geometria da luz</p>
+    <div class="params-grid">
+        <div class="fld">
+            <label>ALTURA LUZ h (mm)</label>
+            <input type="number" id="cfgH" value="25"  min="1" max="500"  step="1">
+        </div>
+        <div class="fld">
+            <label>DISTÂNCIA HORIZONTAL d (mm)</label>
             <input type="number" id="cfgD" value="100" min="1" max="1000" step="1">
         </div>
-        <div class="geo-item">
-            <label>LARGURA REF. (mm)</label>
-            <input type="number" id="cfgLarg" value="210" min="10" max="2000" step="1">
-        </div>
-        <div class="geo-item">
-            <label>ALTURA REF. (mm)</label>
-            <input type="number" id="cfgAlt" value="297" min="10" max="2000" step="1">
-        </div>
     </div>
-    <div class="geo-grid" style="grid-template-columns: 1fr 1fr 1fr;">
-        <div class="geo-item">
+
+    <!-- OPÇÕES ─────────────────────────────────────────── -->
+    <p class="sec">processamento</p>
+    <div class="params-grid2">
+        <div class="fld">
             <label>INTEGRADOR DE DEPTH</label>
             <select id="cfgMetodo">
-                <option value="frankot">Frankot-Chellappa (rápido)</option>
-                <option value="poisson">Poisson (bordas abruptas)</option>
+                <option value="poisson">Poisson / DCT (recomendado)</option>
+                <option value="frankot">Frankot-Chellappa</option>
             </select>
         </div>
-        <div class="geo-item">
-            <div class="geo-toggle">
+        <div class="fld">
+            <div class="chk">
                 <input type="checkbox" id="cfgSuavizar">
                 <span>Suavizar normais (σ=1)</span>
             </div>
         </div>
     </div>
 
-    <!-- Diagrama explicativo -->
-    <div class="geo-diagram">
-        <svg width="130" height="100" viewBox="0 0 130 100">
-            <!-- Surface -->
-            <rect x="10" y="70" width="110" height="4" rx="1" fill="var(--bhi)"/>
-            <text x="65" y="90" text-anchor="middle" font-family="IBM Plex Mono,monospace" font-size="8" fill="var(--dim)">SUPERFÍCIE</text>
-            <!-- Center vertical -->
-            <line x1="65" y1="70" x2="65" y2="20" stroke="var(--border)" stroke-dasharray="3 2" stroke-width="1"/>
-            <!-- Height arrow -->
-            <line x1="92" y1="45" x2="92" y2="70" stroke="var(--grn)" stroke-width="1.5" marker-end="url(#aG)"/>
-            <text x="96" y="60" font-family="IBM Plex Mono,monospace" font-size="7" fill="var(--grn)">h</text>
-            <!-- Distance arrow -->
-            <line x1="65" y1="80" x2="92" y2="80" stroke="var(--acc)" stroke-width="1.5" marker-end="url(#aB)"/>
-            <text x="75" y="78" font-family="IBM Plex Mono,monospace" font-size="7" fill="var(--acc)">d</text>
-            <!-- Light source -->
-            <circle cx="92" cy="45" r="5" fill="var(--warn)" opacity=".9"/>
-            <line x1="92" y1="45" x2="65" y2="70" stroke="var(--warn)" stroke-width="1" stroke-dasharray="2 2"/>
-            <defs>
-                <marker id="aG" viewBox="0 0 8 8" refX="6" refY="4" markerWidth="5" markerHeight="5" orient="auto">
-                    <path d="M1 1L6 4L1 7" fill="none" stroke="var(--grn)" stroke-width="1.5" stroke-linecap="round"/>
-                </marker>
-                <marker id="aB" viewBox="0 0 8 8" refX="6" refY="4" markerWidth="5" markerHeight="5" orient="auto">
-                    <path d="M1 1L6 4L1 7" fill="none" stroke="var(--acc)" stroke-width="1.5" stroke-linecap="round"/>
-                </marker>
-            </defs>
-        </svg>
-        <p>
-            <strong>Sem esfera cromada.</strong> Com h e d conhecidos,<br>
-            o vetor de luz é calculado automaticamente:<br>
-            <code style="color:var(--warn); font-family:var(--mono); font-size:.72rem;">
-                L = normalize([d·sin θ, d·cos θ, h])
-            </code><br>
-            Defina a <strong>direção</strong> de cada foto abaixo.
-        </p>
-    </div>
-
-    <!-- Diretores das 4 fotos -->
-    <p class="ptitle" style="margin-top:18px; margin-bottom:12px;">
-        // direção da luz por foto — clique no compasso ou use os atalhos
-    </p>
-    <div class="cards-luz" id="cardsLuz">
-        <!-- Gerado por JS -->
-    </div>
-
     <div class="btn-row">
-        <button class="btn btn-primary" onclick="avancarParaPlano()" id="btnAvancar" disabled>
-            CONTINUAR → MARCAR REFERÊNCIA
-        </button>
+        <button class="btn btn-primary" id="btnProcessar" onclick="processar()" disabled>▶ PROCESSAR</button>
+        <button class="btn btn-ghost"   onclick="location.reload()">REINICIAR</button>
+        <span id="btnHint" style="font-family:var(--mono);font-size:.65rem;color:var(--dim);margin-left:4px"></span>
     </div>
 </div>
 
-<!-- ══════════════════════════════════════════
-     PAINEL 2 — REFERÊNCIA (plano)
-══════════════════════════════════════════ -->
-<div class="painel" id="painelRef" style="display:none;">
-    <p class="ptitle">// 02 · marcar cantos da referência (folha A4 ou tapete)</p>
-    <div id="instrucao">Aguardando...</div>
-    <div id="barraProgresso"><div id="barraFill" style="width:0%"></div></div>
-    <div class="btn-row">
-        <button class="btn btn-ghost" onclick="desfazer()">← DESFAZER</button>
-        <button class="btn btn-ghost" onclick="location.reload()" style="margin-left:auto;">REINICIAR</button>
-    </div>
-    <div id="wrapCanvas"><canvas id="meuCanvas"></canvas></div>
-</div>
-
-<!-- ══════════════════════════════════════════
-     PAINEL 3 — RESULTADO
-══════════════════════════════════════════ -->
-<div class="painel" id="painelRes" style="display:none;">
-    <p class="ptitle">// resultados · visão retificada</p>
+<!-- ══════════════════════ PAINEL RESULTADO ══════════════════ -->
+<div class="painel" id="painelRes" style="display:none">
+    <p class="ptitle">// resultados</p>
     <div class="res-grid">
         <div class="res-item">
             <img id="imgNormal" src="" alt="Normal Map">
@@ -335,288 +294,294 @@
             <div class="res-lbl"><strong>Depth Map</strong>Integração por gradientes</div>
         </div>
         <div class="res-item">
-            <img id="imgAlbedo" src="" alt="Albedo Map">
+            <img id="imgAlbedo" src="" alt="Albedo">
             <div class="res-lbl"><strong>Albedo Map</strong>Reflectância difusa ρ</div>
         </div>
     </div>
-    <div class="btn-row" style="margin-top:18px;">
+    <div class="btn-row" style="margin-top:16px">
         <button class="btn btn-ghost" onclick="location.reload()">← NOVA SESSÃO</button>
     </div>
 </div>
 
 
 <script>
-// ════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════
 // ESTADO
-// ════════════════════════════════════════════════════════
-const canvas = document.getElementById('meuCanvas');
-const ctx    = canvas.getContext('2d');
-const imgObj = new Image();
+// ════════════════════════════════════════════════════════════
 
-let arquivos  = [];
-let mousePos  = { x:0, y:0 };
-let plano     = [];    // 4 × {x,y}
-let angulos   = [0, 90, 180, 270];  // direção por foto (graus)
-
-// ════════════════════════════════════════════════════════
-// COMPASS — gera os 4 cards de direção
-// ════════════════════════════════════════════════════════
-const PRESETS = [
-    { label: 'N',  ang: 0   },
-    { label: 'E',  ang: 90  },
-    { label: 'S',  ang: 180 },
-    { label: 'W',  ang: 270 },
+// Definições de cada slot (pode editar labels/ângulos)
+const DIRS = [
+    { id: 'N', label: 'Norte',  ang: 0,   color: '#4a9eff' },
+    { id: 'E', label: 'Leste',  ang: 90,  color: '#3ddc97' },
+    { id: 'S', label: 'Sul',    ang: 180, color: '#f4b942' },
+    { id: 'W', label: 'Oeste',  ang: 270, color: '#a78bfa' },
 ];
 
+// Estado por slot: { file: File|null, objectUrl: string|null, ang: number }
+const slots = DIRS.map(d => ({ file: null, objectUrl: null, ang: d.ang }));
+
+// ════════════════════════════════════════════════════════════
+// BUILD CARDS
+// ════════════════════════════════════════════════════════════
 function buildCards() {
-    const cont = document.getElementById('cardsLuz');
-    cont.innerHTML = '';
-    angulos.forEach((ang, i) => {
-        const div = document.createElement('div');
-        div.className = 'card-luz';
-        div.innerHTML = `
-            <span class="clabel">FOTO ${i+1}</span>
-            <div class="compass-wrap" id="cw${i}">
-                ${svgCompass(i, ang)}
+    const grid = document.getElementById('dirGrid');
+    grid.innerHTML = '';
+
+    DIRS.forEach((dir, i) => {
+        const card = document.createElement('div');
+        card.className = 'dir-card';
+        card.id = `card${i}`;
+
+        card.innerHTML = `
+            <!-- thumbnail + file input -->
+            <div class="card-thumb" id="thumb${i}" onclick="document.getElementById('inp${i}').click()">
+                <input type="file" id="inp${i}" accept="image/*" style="display:none"
+                       onchange="onFileSelected(${i}, this)">
+                <img id="timg${i}" src="" alt="">
+                <div class="thumb-placeholder" id="ph${i}">
+                    <span class="add-icon">+</span>
+                    <span>Clique ou arraste</span>
+                    <span style="color:var(--acc);margin-top:2px">${dir.id}</span>
+                </div>
             </div>
-            <div class="dir-presets">
-                ${PRESETS.map(p =>
-                    `<button class="dir-btn${ang===p.ang?' sel':''}"
-                             onclick="setDir(${i},${p.ang})">${p.label}</button>`
-                ).join('')}
-            </div>
-            <div class="angulo-val" id="av${i}">${ang}°</div>
-        `;
-        cont.appendChild(div);
+            <button class="clear-btn" onclick="clearSlot(${i})">✕</button>
+
+            <div class="card-body">
+                <!-- bússola -->
+                <div class="compass-wrap" id="cw${i}" onclick="onCompassClick(event,${i})">
+                    ${svgCompass(i, slots[i].ang, dir.color)}
+                </div>
+
+                <!-- label direção + presets -->
+                <div class="card-dir-label" id="dlabel${i}">
+                    <strong>${dir.id} · ${slots[i].ang}°</strong><br>
+                    <span style="font-size:.58rem;color:var(--dim)">${dir.label}</span>
+                </div>
+
+                <div class="presets" id="presets${i}">
+                    ${DIRS.map(d =>
+                        `<button class="pbtn${slots[i].ang===d.ang?' sel':''}"
+                                 onclick="setAng(${i},${d.ang})">${d.id}</button>`
+                    ).join('')}
+                </div>
+
+                <div class="fname" id="fname${i}"></div>
+            </div>`;
+
+        // Drag & drop no card inteiro
+        card.addEventListener('dragover',  e => { e.preventDefault(); card.classList.add('drag-over'); });
+        card.addEventListener('dragleave', () => card.classList.remove('drag-over'));
+        card.addEventListener('drop', e => {
+            e.preventDefault(); card.classList.remove('drag-over');
+            const file = e.dataTransfer.files[0];
+            if (file && file.type.startsWith('image/')) applyFile(i, file);
+        });
+
+        grid.appendChild(card);
     });
 
-    // Bind compass click
-    angulos.forEach((_, i) => {
-        document.getElementById('cw'+i).addEventListener('click', (e) => {
-            const rect = e.currentTarget.querySelector('svg').getBoundingClientRect();
-            const cx   = rect.left + rect.width  / 2;
-            const cy   = rect.top  + rect.height / 2;
-            const dx   = e.clientX - cx;
-            const dy   = e.clientY - cy;
-            // atan2: 0 = right, go clockwise from North
-            let ang = Math.round(Math.atan2(dx, -dy) * 180 / Math.PI);
-            if (ang < 0) ang += 360;
-            setDir(i, ang);
-        });
-    });
+    updateSlotBar();
+    updateBtn();
 }
 
-function svgCompass(idx, ang) {
-    const R  = 38;
-    const r  = 26;
-    const rad = (ang - 90) * Math.PI / 180;  // SVG: 0° = right
+// ════════════════════════════════════════════════════════════
+// SVG BÚSSOLA
+// ════════════════════════════════════════════════════════════
+function svgCompass(idx, ang, dotColor) {
+    const R = 32, r = 21;
+    const rad  = (ang - 90) * Math.PI / 180;
     const dotX = (r * Math.cos(rad)).toFixed(1);
     const dotY = (r * Math.sin(rad)).toFixed(1);
-    const lx2  = ((r+2) * Math.cos(rad)).toFixed(1);
-    const ly2  = ((r+2) * Math.sin(rad)).toFixed(1);
-
-    return `<svg id="svg${idx}" viewBox="-${R+6} -${R+6} ${(R+6)*2} ${(R+6)*2}" width="88" height="88">
-        <circle r="${R}" fill="none" stroke="var(--border)" stroke-width="1"/>
-        <circle r="2" fill="var(--dim)" opacity=".4"/>
-        <text x="0" y="-${R-4}" text-anchor="middle" font-family="IBM Plex Mono,monospace" font-size="7" fill="var(--dim)">N</text>
+    const lx2  = ((r+1) * Math.cos(rad)).toFixed(1);
+    const ly2  = ((r+1) * Math.sin(rad)).toFixed(1);
+    const vb   = R + 8;
+    return `<svg id="csvg${idx}" viewBox="-${vb} -${vb} ${vb*2} ${vb*2}" width="74" height="74">
+        <circle r="${R}" fill="rgba(13,15,20,.4)" stroke="var(--brd)" stroke-width="1"/>
+        <circle r="2" fill="var(--dim)" opacity=".5"/>
+        <text x="0" y="-${R-5}" text-anchor="middle" font-family="IBM Plex Mono,monospace" font-size="7" fill="var(--dim)">N</text>
         <text x="${R-4}" y="3"   text-anchor="middle" font-family="IBM Plex Mono,monospace" font-size="7" fill="var(--dim)">E</text>
-        <text x="0" y="${R-2}"   text-anchor="middle" font-family="IBM Plex Mono,monospace" font-size="7" fill="var(--dim)">S</text>
+        <text x="0" y="${R-3}"   text-anchor="middle" font-family="IBM Plex Mono,monospace" font-size="7" fill="var(--dim)">S</text>
         <text x="-${R-4}" y="3"  text-anchor="middle" font-family="IBM Plex Mono,monospace" font-size="7" fill="var(--dim)">W</text>
-        <line x1="0" y1="0" x2="${lx2}" y2="${ly2}" stroke="var(--warn)" stroke-width="1.5"/>
-        <circle class="compass-dot" cx="${dotX}" cy="${dotY}" r="5" fill="var(--warn)" stroke="var(--bg)" stroke-width="1.5"/>
+        <line x1="0" y1="0" x2="${lx2}" y2="${ly2}" stroke="${dotColor}" stroke-width="1.5" opacity=".8"/>
+        <circle cx="${dotX}" cy="${dotY}" r="5" fill="${dotColor}" stroke="var(--bg)" stroke-width="1.5"/>
     </svg>`;
 }
 
-function setDir(idx, ang) {
-    angulos[idx] = ((ang % 360) + 360) % 360;
-    buildCards();   // re-render all (simples)
-    document.getElementById('av'+idx).textContent = angulos[idx] + '°';
+function onCompassClick(e, i) {
+    const svg  = document.getElementById(`csvg${i}`);
+    const rect = svg.getBoundingClientRect();
+    const cx   = rect.left + rect.width  / 2;
+    const cy   = rect.top  + rect.height / 2;
+    let ang    = Math.round(Math.atan2(e.clientX - cx, -(e.clientY - cy)) * 180 / Math.PI);
+    if (ang < 0) ang += 360;
+    setAng(i, ang);
 }
 
-// ════════════════════════════════════════════════════════
-// VETORES DE LUZ — calculados da geometria
-// ════════════════════════════════════════════════════════
-function calcVetorLuz(angGraus, hMm, dMm) {
-    // Convenção: N=0°, E=90°, S=180°, W=270°
-    // No espaço da câmera: +X=direita, +Y=cima(invertido px), +Z=câmera
+function setAng(i, ang) {
+    slots[i].ang = ((ang % 360) + 360) % 360;
+    // Re-render bússola + label + presets
+    document.getElementById(`cw${i}`).innerHTML = svgCompass(i, slots[i].ang, DIRS[i].color);
+    document.getElementById(`cw${i}`).onclick = e => onCompassClick(e, i);
+    document.getElementById(`dlabel${i}`).innerHTML =
+        `<strong>${DIRS[i].id} · ${slots[i].ang}°</strong><br>
+         <span style="font-size:.58rem;color:var(--dim)">${DIRS[i].label}</span>`;
+    document.getElementById(`presets${i}`).innerHTML = DIRS.map(d =>
+        `<button class="pbtn${slots[i].ang===d.ang?' sel':''}"
+                 onclick="setAng(${i},${d.ang})">${d.id}</button>`
+    ).join('');
+}
+
+// ════════════════════════════════════════════════════════════
+// FILE HANDLING
+// ════════════════════════════════════════════════════════════
+function onFileSelected(i, input) {
+    if (input.files[0]) applyFile(i, input.files[0]);
+}
+
+function applyFile(i, file) {
+    if (slots[i].objectUrl) URL.revokeObjectURL(slots[i].objectUrl);
+    slots[i].file = file;
+    slots[i].objectUrl = URL.createObjectURL(file);
+
+    const timg = document.getElementById(`timg${i}`);
+    timg.src   = slots[i].objectUrl;
+    timg.style.display = 'block';
+    document.getElementById(`ph${i}`).style.display = 'none';
+    document.getElementById(`card${i}`).classList.add('has-img');
+    document.getElementById(`fname${i}`).textContent = file.name;
+
+    updateSlotBar();
+    updateBtn();
+}
+
+function clearSlot(i) {
+    if (slots[i].objectUrl) URL.revokeObjectURL(slots[i].objectUrl);
+    slots[i].file = null; slots[i].objectUrl = null;
+    const timg = document.getElementById(`timg${i}`);
+    timg.src = ''; timg.style.display = 'none';
+    document.getElementById(`ph${i}`).style.display = 'flex';
+    document.getElementById(`card${i}`).classList.remove('has-img');
+    document.getElementById(`fname${i}`).textContent = '';
+    document.getElementById(`inp${i}`).value = '';
+    updateSlotBar(); updateBtn();
+}
+
+// ════════════════════════════════════════════════════════════
+// STATUS BAR
+// ════════════════════════════════════════════════════════════
+function updateSlotBar() {
+    const bar = document.getElementById('slotBar');
+    bar.innerHTML = slots.map((s, i) =>
+        `<span class="slot-dot${s.file ? ' ok' : ''}">
+            <span style="color:${DIRS[i].color}">${DIRS[i].id}</span>
+            ${s.file ? '✓ ' + truncName(s.file.name) : '— sem imagem'}
+        </span>`
+    ).join('');
+}
+
+function truncName(n) {
+    return n.length > 18 ? n.slice(0,15) + '…' : n;
+}
+
+function updateBtn() {
+    const ok = slots.every(s => s.file !== null);
+    document.getElementById('btnProcessar').disabled = !ok;
+    document.getElementById('btnHint').textContent =
+        ok ? '' : `${slots.filter(s=>s.file).length}/4 imagens associadas`;
+}
+
+// ════════════════════════════════════════════════════════════
+// ROI PREVIEW
+// ════════════════════════════════════════════════════════════
+function atualizarROI() {
+    const focal  = parseFloat(document.getElementById('cfgFocal').value)  || 50;
+    const sensor = parseFloat(document.getElementById('cfgSensor').value) || 36;
+    const camH   = parseFloat(document.getElementById('cfgCamH').value)   || 1070;
+    const wbL    = parseFloat(document.getElementById('cfgWbLarg').value) || 1000;
+    const wbP    = parseFloat(document.getElementById('cfgWbProf').value) || 600;
+
+    const physW = camH * sensor / focal;
+    const physH = physW * (wbP / wbL);
+    const rX    = Math.min(wbL / physW * 100, 100).toFixed(0);
+    const rY    = Math.min(wbP / physH * 100, 100).toFixed(0);
+
+    const badge = document.getElementById('roiBadge');
+    badge.style.display = 'block';
+    badge.innerHTML =
+        `Campo visível: <strong>${physW.toFixed(0)} × ${physH.toFixed(0)} mm</strong> ` +
+        `→ bancada ocupa ≈ <strong>${rX}%</strong> × <strong>${rY}%</strong> da imagem`;
+}
+
+// ════════════════════════════════════════════════════════════
+// VETORES DE LUZ
+// ════════════════════════════════════════════════════════════
+function calcVetor(angGraus, h, d) {
     const rad = angGraus * Math.PI / 180;
-    const lx  =  dMm * Math.sin(rad);   // E→+X, W→-X
-    const ly  =  dMm * Math.cos(rad);   // N→+Y, S→-Y
-    const lz  =  hMm;
+    const lx = d * Math.sin(rad), ly = d * Math.cos(rad), lz = h;
     const mag = Math.sqrt(lx*lx + ly*ly + lz*lz);
     return [lx/mag, ly/mag, lz/mag];
 }
 
-// ════════════════════════════════════════════════════════
-// UPLOAD
-// ════════════════════════════════════════════════════════
-function onFileChange(input) {
-    const n = input.files.length;
-    document.getElementById('fileCount').textContent =
-        n > 0 ? `${n} arquivo(s) selecionado(s)` : '';
-    document.getElementById('btnAvancar').disabled = (n !== 4);
-    if (n !== 4 && n > 0) notif('Selecione exatamente 4 imagens.');
-}
+// ════════════════════════════════════════════════════════════
+// PROCESSAR
+// ════════════════════════════════════════════════════════════
+async function processar() {
+    if (!slots.every(s => s.file)) return notif('Associe uma imagem a cada direção.');
 
-async function avancarParaPlano() {
-    const input = document.getElementById('inputImagens');
-    if (input.files.length !== 4) return notif('Selecione exatamente 4 imagens.');
-
-    loading('Fazendo upload...');
+    // 1. Upload — preserva a ORDEM N→E→S→W
+    loading('Fazendo upload (N → E → S → W)...');
     const fd = new FormData();
-    for (let i = 0; i < 4; i++) fd.append('imagens', input.files[i]);
-    const res  = await fetch('/upload_imagens', { method:'POST', body:fd });
-    const data = await res.json();
-    stopLoading();
+    slots.forEach(s => fd.append('imagens', s.file));
 
-    arquivos = data.arquivos;
-    document.getElementById('painelUpload').style.display = 'none';
-    document.getElementById('painelRef').style.display    = 'block';
+    let upData;
+    try {
+        const r = await fetch('/upload_imagens', { method:'POST', body: fd });
+        if (!r.ok) { const e = await r.json(); throw new Error(e.detail || 'Upload falhou'); }
+        upData = await r.json();
+    } catch(e) { stopLoading(); return notif(e.message); }
+
+    // 2. Processar
+    loading('Calculando normal map, depth e albedo...');
     setStep(1);
-    carregarImg();
-}
 
-// ════════════════════════════════════════════════════════
-// CANVAS — marcação do plano de referência
-// ════════════════════════════════════════════════════════
-function carregarImg() {
-    imgObj.src = `/uploads/${arquivos[0]}`;
-    imgObj.onload = () => {
-        canvas.width  = imgObj.width;
-        canvas.height = imgObj.height;
-        atualizarInstr();
-        render();
-    };
-}
-
-function render() {
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    ctx.drawImage(imgObj, 0, 0);
-    desenharPlano();
-    desenharCursor();
-}
-
-function desenharPlano() {
-    if (!plano.length) return;
-    ctx.strokeStyle = '#f4b942';
-    ctx.lineWidth   = 2;
-    ctx.setLineDash([6, 3]);
-    ctx.beginPath();
-    ctx.moveTo(plano[0].x, plano[0].y);
-    for (let i = 1; i < plano.length; i++) ctx.lineTo(plano[i].x, plano[i].y);
-    if (plano.length < 4) { ctx.lineTo(mousePos.x, mousePos.y); }
-    if (plano.length === 4) ctx.closePath();
-    ctx.stroke();
-    ctx.setLineDash([]);
-
-    ctx.fillStyle = '#f4b942';
-    plano.forEach((pt, i) => {
-        ctx.beginPath(); ctx.arc(pt.x, pt.y, 5, 0, Math.PI*2); ctx.fill();
-        ctx.fillStyle = '#0d0f14';
-        ctx.font = 'bold 10px IBM Plex Mono, monospace';
-        ctx.textAlign = 'center';
-        ctx.fillText(i+1, pt.x, pt.y+4);
-        ctx.fillStyle = '#f4b942';
-    });
-}
-
-function desenharCursor() {
-    const {x, y} = mousePos;
-    ctx.strokeStyle = 'rgba(255,255,255,0.3)';
-    ctx.lineWidth = 1; ctx.setLineDash([3,3]);
-    ctx.beginPath();
-    ctx.moveTo(x,0); ctx.lineTo(x,canvas.height);
-    ctx.moveTo(0,y); ctx.lineTo(canvas.width,y);
-    ctx.stroke(); ctx.setLineDash([]);
-}
-
-function canvasXY(e) {
-    const r = canvas.getBoundingClientRect();
-    return {
-        x: (e.clientX - r.left) * (canvas.width  / r.width),
-        y: (e.clientY - r.top)  * (canvas.height / r.height),
-    };
-}
-
-canvas.addEventListener('mousemove', (e) => { mousePos = canvasXY(e); render(); });
-
-canvas.addEventListener('click', (e) => {
-    if (plano.length >= 4) return;
-    const {x, y} = canvasXY(e);
-    plano.push({x, y});
-    document.getElementById('barraFill').style.width = (plano.length / 4 * 100) + '%';
-    atualizarInstr();
-    render();
-    if (plano.length === 4) setTimeout(enviarBackend, 300);
-});
-
-function desfazer() {
-    if (plano.length > 0) {
-        plano.pop();
-        document.getElementById('barraFill').style.width = (plano.length / 4 * 100) + '%';
-        atualizarInstr();
-        render();
-    }
-}
-
-function atualizarInstr() {
-    const n = plano.length;
-    const msgs = [
-        'Clique no <strong>canto 1</strong> (TL — superior esquerdo) da folha de referência',
-        'Clique no <strong>canto 2</strong> (TR — superior direito)',
-        'Clique no <strong>canto 3</strong> (BR — inferior direito)',
-        'Clique no <strong>canto 4</strong> (BL — inferior esquerdo)',
-        '✓ Referência marcada — enviando para processamento...',
-    ];
-    document.getElementById('instrucao').innerHTML = msgs[n] || msgs[4];
-}
-
-// ════════════════════════════════════════════════════════
-// BACKEND
-// ════════════════════════════════════════════════════════
-async function enviarBackend() {
-    loading('Calculando vetores de luz e normais...');
-    setStep(2);
-
-    const h  = parseFloat(document.getElementById('cfgH').value)    || 25;
-    const d  = parseFloat(document.getElementById('cfgD').value)    || 100;
-    const lw = parseFloat(document.getElementById('cfgLarg').value) || 210;
-    const lh = parseFloat(document.getElementById('cfgAlt').value)  || 297;
-
-    // Computa vetores de luz a partir da geometria — sem chrome ball
-    const vetores_luz = angulos.map(ang => calcVetorLuz(ang, h, d));
+    const h = parseFloat(document.getElementById('cfgH').value) || 25;
+    const d = parseFloat(document.getElementById('cfgD').value) || 100;
 
     const payload = {
-        arquivos,
-        plano,
-        vetores_luz,          // pré-computados, backend não precisa mais da esfera
-        largura_mm:  lw,
-        altura_mm:   lh,
+        arquivos:        upData.arquivos,
+        vetores_luz:     slots.map(s => calcVetor(s.ang, h, d)),
+        focal_mm:        parseFloat(document.getElementById('cfgFocal').value)  || 50,
+        sensor_w_mm:     parseFloat(document.getElementById('cfgSensor').value) || 36,
+        camera_h_mm:     parseFloat(document.getElementById('cfgCamH').value)   || 1070,
+        wb_larg_mm:      parseFloat(document.getElementById('cfgWbLarg').value) || 1000,
+        wb_prof_mm:      parseFloat(document.getElementById('cfgWbProf').value) || 600,
         metodo_depth:    document.getElementById('cfgMetodo').value,
         suavizar_normais: document.getElementById('cfgSuavizar').checked,
     };
 
-    const res  = await fetch('/processar', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-    });
-    const data = await res.json();
-    stopLoading();
+    let data;
+    try {
+        const r = await fetch('/processar', {
+            method:'POST', headers:{'Content-Type':'application/json'},
+            body: JSON.stringify(payload)
+        });
+        if (!r.ok) { const e = await r.json(); throw new Error(e.detail || 'Processamento falhou'); }
+        data = await r.json();
+    } catch(e) { stopLoading(); setStep(0); return notif(e.message); }
 
+    stopLoading();
     const ts = '?t=' + Date.now();
     document.getElementById('imgNormal').src = data.normal_url + ts;
     document.getElementById('imgDepth').src  = data.depth_url  + ts;
     document.getElementById('imgAlbedo').src = data.albedo_url + ts;
-
-    document.getElementById('painelRef').style.display = 'none';
-    document.getElementById('painelRes').style.display = 'block';
-    setStep(2);
+    document.getElementById('painelSetup').style.display = 'none';
+    document.getElementById('painelRes').style.display   = 'block';
+    setStep(1);
 }
 
-// ════════════════════════════════════════════════════════
-// UI HELPERS
-// ════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════
+// HELPERS
+// ════════════════════════════════════════════════════════════
 function setStep(n) {
     document.querySelectorAll('.step').forEach((el, i) => {
         el.classList.toggle('ativo', i === n);
@@ -624,28 +589,19 @@ function setStep(n) {
     });
 }
 function loading(msg) {
-    document.getElementById('loadingMsg').textContent = msg || 'Processando...';
+    document.getElementById('loadingMsg').textContent = msg;
     document.getElementById('loadingOverlay').classList.add('vis');
 }
 function stopLoading() { document.getElementById('loadingOverlay').classList.remove('vis'); }
 function notif(msg) {
     const el = document.getElementById('notif');
     el.textContent = msg; el.classList.add('vis');
-    setTimeout(() => el.classList.remove('vis'), 3000);
+    setTimeout(() => el.classList.remove('vis'), 3500);
 }
-
-// Drag & drop
-const zona = document.getElementById('zonaUpload');
-zona.addEventListener('dragover',  (e) => { e.preventDefault(); zona.classList.add('hover'); });
-zona.addEventListener('dragleave', ()  => zona.classList.remove('hover'));
-zona.addEventListener('drop',      (e) => {
-    e.preventDefault(); zona.classList.remove('hover');
-    document.getElementById('inputImagens').files = e.dataTransfer.files;
-    onFileChange(document.getElementById('inputImagens'));
-});
 
 // Init
 buildCards();
+atualizarROI();
 </script>
 </body>
 </html>
