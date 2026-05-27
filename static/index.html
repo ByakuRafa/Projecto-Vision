@@ -1,406 +1,629 @@
-"""
-cv_core.py — Pipeline de Estéreo Fotométrico · Modo Blender (câmara ortogonal fixa)
-
-Diferenças em relação à versão anterior:
-  1. calcular_roi_blender(): gera a máscara ROI automaticamente a partir dos
-     parâmetros da câmara e da bancada — sem seleção manual de cantos.
-  2. processar_mapas() aceita camera_ortogonal=True:
-     quando verdadeiro, o passo de homografia/rotação é completamente omitido
-     (câmara apontando direto para baixo = normais já no referencial correto).
-  3. plano_coords é opcional; se ausente e camera_ortogonal=True, a ROI é
-     calculada via calcular_roi_blender().
-"""
-
-import cv2
-import numpy as np
-import os
-from scipy.ndimage import gaussian_filter
-from scipy.fft import dctn, idctn
-
-
-# ==============================================================
-# MÓDULO 1 — VETOR DE LUZ POR GEOMETRIA
-# ==============================================================
-
-def calcular_vetor_luz_geometria(angulo_graus: float,
-                                  h_mm: float,
-                                  d_mm: float) -> list[float]:
-    """
-    Vetor unitário de iluminação calculado da geometria física do setup.
-
-    Convenção (0°=Norte=topo da imagem, sentido horário):
-        0°  → L = [ 0, +d, h]
-        90° → L = [+d,  0, h]
-       180° → L = [ 0, -d, h]
-       270° → L = [-d,  0, h]
-    """
-    rad = angulo_graus * np.pi / 180.0
-    lx  =  d_mm * np.sin(rad)
-    ly  =  d_mm * np.cos(rad)
-    lz  =  h_mm
-    mag = np.sqrt(lx**2 + ly**2 + lz**2)
-    return [lx / mag, ly / mag, lz / mag]
-
-
-# ==============================================================
-# MÓDULO 2 — ROI
-# ==============================================================
-
-def calcular_roi_blender(img_largura:     int,
-                          img_altura:     int,
-                          wb_larg_mm:     float,
-                          wb_prof_mm:     float,
-                          camera_h_mm:    float,
-                          focal_mm:       float,
-                          sensor_w_mm:    float,
-                          erosao_px:      int = 8) -> np.ndarray:
-    """
-    Gera máscara ROI booleana automaticamente a partir dos parâmetros
-    da câmara Blender e das dimensões físicas da bancada.
-
-    Geometria (câmara perspectiva apontada para baixo, centrada):
-        phys_w = camera_h_mm * sensor_w_mm / focal_mm   ← largura visível
-        phys_h = phys_w * img_altura / img_largura       ← altura visível (aspect)
-        roi_hw = (wb_larg_mm / phys_w) * img_largura / 2 ← meia-largura em px
-        roi_hh = (wb_prof_mm / phys_h) * img_altura  / 2 ← meia-altura  em px
-
-    Se a bancada for maior que o campo de visão (ratio > 1), a ROI
-    ocupa a imagem toda naquela dimensão.
-
-    Args:
-        img_largura, img_altura : resolução da imagem em pixels
-        wb_larg_mm, wb_prof_mm  : dimensões físicas da bancada em mm
-        camera_h_mm             : altura da câmara acima da bancada em mm
-        focal_mm                : comprimento focal da lente (mm)
-        sensor_w_mm             : largura do sensor (mm) — padrão Blender: 36
-        erosao_px               : erosão interna para excluir bordas
-
-    Returns:
-        máscara bool (img_altura × img_largura)
-    """
-    phys_w  = camera_h_mm * sensor_w_mm / focal_mm
-    phys_h  = phys_w * img_altura / img_largura
-
-    roi_hw = min((wb_larg_mm / phys_w) * img_largura / 2.0,  img_largura / 2.0)
-    roi_hh = min((wb_prof_mm / phys_h) * img_altura  / 2.0,  img_altura  / 2.0)
-
-    cx, cy = img_largura / 2.0, img_altura / 2.0
-
-    pts = np.array([
-        [cx - roi_hw, cy - roi_hh],   # TL
-        [cx + roi_hw, cy - roi_hh],   # TR
-        [cx + roi_hw, cy + roi_hh],   # BR
-        [cx - roi_hw, cy + roi_hh],   # BL
-    ], dtype=np.int32)
-
-    mascara = np.zeros((img_altura, img_largura), dtype=np.uint8)
-    cv2.fillPoly(mascara, [pts], 255)
-
-    if erosao_px > 0:
-        kernel  = np.ones((erosao_px, erosao_px), np.uint8)
-        mascara = cv2.erode(mascara, kernel, iterations=1)
-
-    return mascara.astype(bool)
-
-
-def criar_mascara_roi(plano_coords: list[dict],
-                      altura: int,
-                      largura: int,
-                      erosao_px: int = 8) -> np.ndarray:
-    """ROI a partir de 4 cantos marcados manualmente (mantido para compatibilidade)."""
-    pts = np.array([[p['x'], p['y']] for p in plano_coords], dtype=np.int32)
-    mascara = np.zeros((altura, largura), dtype=np.uint8)
-    cv2.fillPoly(mascara, [pts], 255)
-    if erosao_px > 0:
-        kernel  = np.ones((erosao_px, erosao_px), np.uint8)
-        mascara = cv2.erode(mascara, kernel, iterations=1)
-    return mascara.astype(bool)
-
-
-# ==============================================================
-# MÓDULO 3 — PRÉ-PROCESSAMENTO
-# ==============================================================
-
-def load_and_flatten(filepath: str) -> np.ndarray:
-    img = cv2.imread(filepath, cv2.IMREAD_GRAYSCALE)
-    if img is None:
-        raise FileNotFoundError(f"Imagem não encontrada: {filepath}")
-    return img.astype(np.float64) / 255.0
-
-
-def subtrair_luz_ambiente(imgs: list[np.ndarray],
-                           mascara_roi: np.ndarray | None = None) -> list[np.ndarray]:
-    """
-    Remove a componente de luz ambiente pixel a pixel.
-
-    Método: min(I1, I2, I3, I4) em cada pixel — é a melhor estimativa possível
-    da luz ambiente, pois em pelo menos uma das 4 direções o pixel recebe
-    somente a componente difusa mínima (ou está em sombra).
-
-    Muito mais eficaz do que um percentil global para renders Blender onde
-    a iluminação ambiente do World pode variar pela cena.
-    """
-    stack    = np.stack(imgs, axis=0)          # (N, H, W)
-    ambiente = np.min(stack, axis=0)           # mínimo pixel-a-pixel entre as N imagens
-    return [np.clip(img - ambiente, 0.0, 1.0) for img in imgs]
-
-
-def criar_mascara_valida(imgs: list[np.ndarray],
-                          mascara_roi:      np.ndarray | None = None,
-                          thresh_variacao:  float = 0.04,
-                          thresh_sat:       float = 0.95) -> np.ndarray:
-    """
-    Pixel válido = apresenta variação real entre as 4 imagens.
-
-    std(I1..IN) > thresh_variacao garante que o pixel foi efetivamente
-    iluminado de formas diferentes e não está:
-      - sempre em sombra (std ≈ 0, baixo)
-      - sempre saturado  (std ≈ 0, alto)
-      - num shadow cast de outro objeto (variação mínima)
-
-    Isto substitui o threshold absoluto anterior que excluía pixels
-    escuros legítimos e deixava passar pixels com sombra constante.
-    """
-    stack    = np.stack(imgs, axis=0)          # (N, H, W)
-    variacao = np.std(stack, axis=0)           # desvio padrão por pixel
-
-    mascara = variacao > thresh_variacao
-    if mascara_roi is not None:
-        mascara &= mascara_roi
-    # Excluir saturados em qualquer das imagens
-    for img in imgs:
-        mascara &= (img < thresh_sat)
-    return mascara
-
-
-# ==============================================================
-# MÓDULO 4 — CORREÇÃO DE PERSPECTIVA (somente câmara não-ortogonal)
-# ==============================================================
-
-def calcular_rotacao_por_homografia(pontos_imagem: list[dict],
-                                     largura_mm: float = 210.0,
-                                     altura_mm:  float = 297.0) -> np.ndarray:
-    w, h = float(largura_mm), float(altura_mm)
-    pts_mundo = np.array([[0,0],[w,0],[w,h],[0,h]], dtype=np.float32)
-    pts_img   = np.array([[p['x'], p['y']] for p in pontos_imagem], dtype=np.float32)
-    H, _ = cv2.findHomography(pts_img, pts_mundo)
-    if H is None:
-        return np.eye(3)
-    h1 = H[:, 0];  h2 = H[:, 1]
-    lam = 1.0 / (np.linalg.norm(h1) + 1e-12)
-    r1  = h1 * lam;  r2 = h2 * lam;  r3 = np.cross(r1, r2)
-    R_raw = np.stack([r1, r2, r3], axis=1)
-    U, _, Vt = np.linalg.svd(R_raw)
-    R = U @ Vt
-    if np.linalg.det(R) < 0:
-        U[:, -1] *= -1
-        R = U @ Vt
-    return R
-
-
-def aplicar_rotacao_normais(N_flat: np.ndarray, R: np.ndarray) -> np.ndarray:
-    N_rot = R @ N_flat
-    normas = np.linalg.norm(N_rot, axis=0)
-    return np.divide(N_rot, normas, out=np.zeros_like(N_rot), where=normas > 1e-9)
-
-
-# ==============================================================
-# MÓDULO 5 — INTEGRAÇÃO DE GRADIENTES → DEPTH MAP
-# ==============================================================
-
-def frankot_chellappa(p: np.ndarray, q: np.ndarray) -> np.ndarray:
-    rows, cols = p.shape
-    u = np.fft.fftfreq(cols) * 2 * np.pi
-    v = np.fft.fftfreq(rows) * 2 * np.pi
-    U, V = np.meshgrid(u, v)
-    den = U**2 + V**2;  den[0, 0] = 1.0
-    Z_fft = -1j * (U * np.fft.fft2(p) + V * np.fft.fft2(q)) / den
-    Z_fft[0, 0] = 0.0
-    return np.real(np.fft.ifft2(Z_fft))
-
-
-def poisson_depth(p: np.ndarray, q: np.ndarray) -> np.ndarray:
-    """Solver DCT analítico O(N log N) com boundary conditions de Neumann."""
-    rows, cols = p.shape
-    div = np.zeros((rows, cols))
-    div[:-1, :] += q[:-1, :] - q[1:, :]
-    div[:, :-1] += p[:, :-1] - p[:, 1:]
-    ii  = np.arange(rows).reshape(-1, 1)
-    jj  = np.arange(cols).reshape(1, -1)
-    lam = (2.0 * np.cos(np.pi * ii / rows) - 2.0) + \
-          (2.0 * np.cos(np.pi * jj / cols) - 2.0)
-    lam[0, 0] = 1.0
-    Z_dct      = dctn(div, norm='ortho') / lam
-    Z_dct[0,0] = 0.0
-    return idctn(Z_dct, norm='ortho')
-
-
-# ==============================================================
-# MÓDULO 6 — PIPELINE PRINCIPAL
-# ==============================================================
-
-def processar_mapas(
-    caminhos_imagens:  list[str],
-    vetores_luz:       list[list[float]],
-    diretorio_saida:   str,
-    # ── ROI manual (compatibilidade) ─────────────────────────
-    plano_coords:      list[dict] | None = None,
-    largura_mm:        float = 210.0,
-    altura_mm:         float = 297.0,
-    # ── ROI automático (modo Blender) ─────────────────────────
-    camera_ortogonal:  bool  = False,   # True = câmara reta para baixo, sem homografia
-    wb_larg_mm:        float | None = None,
-    wb_prof_mm:        float | None = None,
-    camera_h_mm:       float | None = None,
-    focal_mm:          float = 50.0,
-    sensor_w_mm:       float = 36.0,
-    # ── Opções ────────────────────────────────────────────────
-    metodo_depth:      str   = 'poisson',
-    suavizar_normais:  bool  = False,
-    sigma_suavizacao:  float = 1.0,
-    # Controle de qualidade da máscara:
-    # Aumente thresh_variacao (ex: 0.08) se aparecerem artefatos no fundo.
-    # Diminua (ex: 0.02) se objetos de cor uniforme sumam da máscara.
-    thresh_variacao:   float = 0.04,
-    thresh_sat:        float = 0.95,
-) -> tuple[str, str, str]:
-    """
-    Pipeline completo de Estéreo Fotométrico.
-
-    Modo Blender (camera_ortogonal=True):
-      • ROI calculada automaticamente via calcular_roi_blender()
-      • Passo de homografia/rotação de normais é OMITIDO —
-        câmara já está alinhada com a normal da superfície.
-      • Requer: wb_larg_mm, wb_prof_mm, camera_h_mm.
-
-    Modo manual (camera_ortogonal=False, plano_coords fornecido):
-      • ROI = polígono marcado manualmente.
-      • Rotação de normais calculada por homografia.
-    """
-
-    # ── 1. CARREGAMENTO ──────────────────────────────────────
-    imgs            = [load_and_flatten(c) for c in caminhos_imagens]
-    altura, largura = imgs[0].shape
-
-    # ── 2. MÁSCARA ROI ──────────────────────────────────────
-    if camera_ortogonal and all(v is not None for v in [wb_larg_mm, wb_prof_mm, camera_h_mm]):
-        # Modo Blender: ROI calculada automaticamente
-        mascara_roi = calcular_roi_blender(
-            img_largura  = largura,
-            img_altura   = altura,
-            wb_larg_mm   = wb_larg_mm,
-            wb_prof_mm   = wb_prof_mm,
-            camera_h_mm  = camera_h_mm,
-            focal_mm     = focal_mm,
-            sensor_w_mm  = sensor_w_mm,
-        )
-    elif plano_coords and len(plano_coords) >= 4:
-        # Modo manual
-        mascara_roi = criar_mascara_roi(plano_coords, altura, largura)
-    else:
-        mascara_roi = None   # Sem ROI — processa imagem inteira
-
-    # ── 3. PRÉ-PROCESSAMENTO ────────────────────────────────
-    imgs    = subtrair_luz_ambiente(imgs, mascara_roi)
-    mascara = criar_mascara_valida(imgs, mascara_roi,
-                                   thresh_variacao=thresh_variacao,
-                                   thresh_sat=thresh_sat)
-    idx_val = np.where(mascara.flatten())[0]
-
-    pct_val = 100.0 * len(idx_val) / (altura * largura)
-    print(f"  [mask] {len(idx_val)} px válidos ({pct_val:.1f}% da imagem)")
-
-    if len(idx_val) == 0:
-        raise ValueError(
-            "Nenhum pixel válido após mascaramento. "
-            "Reduza thresh_variacao ou verifique os parâmetros da câmara/bancada."
-        )
-
-    # ── 4. VETORES DE LUZ ───────────────────────────────────
-    L = np.array(vetores_luz, dtype=np.float64)
-    L = L / np.linalg.norm(L, axis=1, keepdims=True)
-
-    # ── 5. LEAST-SQUARES FOTOMÉTRICO ────────────────────────
-    n_pixels = altura * largura
-    I_stack  = np.stack([img.flatten() for img in imgs])
-    I_val    = I_stack[:, idx_val]
-    G_val, _, _, _ = np.linalg.lstsq(L, I_val, rcond=None)
-
-    albedo_val = np.linalg.norm(G_val, axis=0)
-    N_val      = np.divide(G_val, albedo_val,
-                           out=np.zeros_like(G_val),
-                           where=albedo_val > 1e-9)
-
-    N_flat      = np.zeros((3, n_pixels))
-    albedo_flat = np.zeros(n_pixels)
-    N_flat[:, idx_val]   = N_val
-    albedo_flat[idx_val] = albedo_val
-
-    # ── 6. CORREÇÃO DE PERSPECTIVA (só modo manual) ─────────
-    # Modo Blender: câmara já está perpendicular à bancada →
-    # as normais calculadas já estão no referencial correto.
-    # Aplicar a homografia aqui introduziria erro, não corrigiria nada.
-    if not camera_ortogonal and plano_coords and len(plano_coords) >= 4:
-        R      = calcular_rotacao_por_homografia(plano_coords, largura_mm, altura_mm)
-        N_flat = aplicar_rotacao_normais(N_flat, R)
-
-    # ── 7. SUAVIZAÇÃO OPCIONAL ──────────────────────────────
-    if suavizar_normais:
-        for i in range(3):
-            canal     = N_flat[i].reshape(altura, largura)
-            N_flat[i] = gaussian_filter(canal, sigma=sigma_suavizacao).flatten()
-        normas = np.linalg.norm(N_flat, axis=0)
-        N_flat = np.divide(N_flat, normas, out=np.zeros_like(N_flat), where=normas > 1e-9)
-
-    # ── 8. NORMAL MAP ───────────────────────────────────────
-    nx = N_flat[0].reshape(altura, largura)
-    ny = N_flat[1].reshape(altura, largura)
-    nz = N_flat[2].reshape(altura, largura)
-    N_rgb = np.stack([
-        np.clip((nx + 1.0) * 127.5, 0, 255),
-        np.clip((ny + 1.0) * 127.5, 0, 255),
-        np.clip((nz + 1.0) * 127.5, 0, 255),
-    ], axis=-1).astype(np.uint8)
-
-    # ── 9. DEPTH MAP ────────────────────────────────────────
-    nz_safe = np.where(np.abs(nz) < 0.01, np.sign(nz + 1e-12) * 0.01, nz)
-    p_grad  = np.clip(-nx / nz_safe, -10.0, 10.0)
-    q_grad  = np.clip(-ny / nz_safe, -10.0, 10.0)
-
-    # Forçar gradientes a zero fora da máscara para não contaminar a integração
-    p_grad[~mascara] = 0.0
-    q_grad[~mascara] = 0.0
-
-    depth_raw = poisson_depth(p_grad, q_grad) if metodo_depth == 'poisson' \
-                else frankot_chellappa(p_grad, q_grad)
-
-    reg_m = mascara if mascara.any() else np.ones_like(mascara)
-    d_min = np.percentile(depth_raw[reg_m], 2)
-    d_max = np.percentile(depth_raw[reg_m], 98)
-    depth_norm = np.clip(
-        (depth_raw - d_min) / (d_max - d_min + 1e-9) * 255.0, 0, 255
-    ).astype(np.uint8)
-
-    # Suavização leve do depth final (σ=1) para reduzir ruído de integração
-    # sem distorcer as normais — só aplicada dentro da máscara válida
-    depth_smooth = cv2.GaussianBlur(depth_norm, (5, 5), sigmaX=1.0)
-    depth_vis    = np.where(reg_m, depth_smooth, depth_norm)
-
-    # ── 10. ALBEDO MAP ──────────────────────────────────────
-    albedo_2d = albedo_flat.reshape(altura, largura)
-    reg_a     = albedo_2d[reg_m]
-    a_min, a_max = np.percentile(reg_a, 1), np.percentile(reg_a, 99)
-    albedo_vis = np.clip(
-        (albedo_2d - a_min) / (a_max - a_min + 1e-9) * 255.0, 0, 255
-    ).astype(np.uint8)
-
-    # ── 11. SALVAR ──────────────────────────────────────────
-    p_normal = os.path.join(diretorio_saida, 'resultado_normal.png')
-    p_depth  = os.path.join(diretorio_saida, 'resultado_depth.png')
-    p_albedo = os.path.join(diretorio_saida, 'resultado_albedo.png')
-
-    cv2.imwrite(p_normal, cv2.cvtColor(N_rgb, cv2.COLOR_RGB2BGR))
-    cv2.imwrite(p_depth,  depth_vis)
-    cv2.imwrite(p_albedo, albedo_vis)
-
-    return 'resultado_normal.png', 'resultado_depth.png', 'resultado_albedo.png'
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PhotoStereo — Blender Mode</title>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@300;400;500&display=swap" rel="stylesheet">
+<style>
+:root {
+    --bg:    #0d0f14; --surf:  #151820; --surf2: #1c2030;
+    --brd:   #2a3045; --bhi:   #3d4f6e; --text:  #c8d3e8;
+    --dim:   #6b7a99; --acc:   #4a9eff; --grn:   #3ddc97;
+    --warn:  #f4b942; --danger:#f46e6e; --purp:  #a78bfa;
+    --mono: 'IBM Plex Mono', monospace;
+    --sans: 'IBM Plex Sans', sans-serif;
+}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{font-family:var(--sans);background:var(--bg);color:var(--text);
+     min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:24px 16px 60px}
+
+header{width:100%;max-width:960px;display:flex;align-items:baseline;gap:16px;
+       margin-bottom:24px;padding-bottom:14px;border-bottom:1px solid var(--brd)}
+header h1{font-family:var(--mono);font-size:1rem;font-weight:600;color:var(--acc);letter-spacing:.05em}
+header span{font-family:var(--mono);font-size:.7rem;color:var(--dim);letter-spacing:.08em}
+
+/* STEPPER */
+#stepper{display:flex;max-width:960px;width:100%;margin-bottom:18px}
+.step{flex:1;text-align:center;padding:8px 4px;font-family:var(--mono);font-size:.63rem;
+      color:var(--dim);border-bottom:2px solid var(--brd);transition:color .2s,border-color .2s;letter-spacing:.04em}
+.step .sn{display:block;font-size:.52rem;margin-bottom:2px;opacity:.4}
+.step.ativo{color:var(--acc);border-color:var(--acc)}
+.step.ok{color:var(--grn);border-color:var(--grn)}
+
+.painel{width:100%;max-width:960px;background:var(--surf);border:1px solid var(--brd);
+        border-radius:6px;padding:20px;margin-bottom:14px}
+.ptitle{font-family:var(--mono);font-size:.68rem;color:var(--dim);letter-spacing:.1em;
+        text-transform:uppercase;margin-bottom:14px}
+.sec{font-family:var(--mono);font-size:.58rem;color:var(--dim);letter-spacing:.1em;
+     text-transform:uppercase;margin:18px 0 8px;padding-bottom:5px;border-bottom:1px solid var(--brd)}
+
+/* ───────────────────────────────────────────────
+   CARDS DE DIREÇÃO (4 slots de imagem + bússola)
+─────────────────────────────────────────────── */
+.dir-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}
+
+.dir-card{
+    background:var(--surf2);border:1.5px solid var(--brd);border-radius:8px;
+    display:flex;flex-direction:column;align-items:center;gap:0;overflow:hidden;
+    transition:border-color .2s,background .15s;position:relative;
+}
+.dir-card.has-img   {border-color:var(--grn)}
+.dir-card.drag-over {border-color:var(--acc);background:rgba(74,158,255,.06)}
+.dir-card.drag-over * {pointer-events:none}
+
+/* thumbnail */
+.card-thumb{
+    width:100%;aspect-ratio:4/3;background:#0a0c10;
+    display:flex;align-items:center;justify-content:center;
+    overflow:hidden;position:relative;cursor:pointer;
+}
+.card-thumb img{width:100%;height:100%;object-fit:cover;display:none}
+.card-thumb .thumb-placeholder{
+    display:flex;flex-direction:column;align-items:center;gap:6px;
+    font-family:var(--mono);font-size:.62rem;color:var(--dim);
+}
+.card-thumb .thumb-placeholder .add-icon{font-size:1.4rem;opacity:.3}
+.card-thumb:hover .thumb-placeholder{color:var(--acc)}
+.card-thumb:hover .add-icon{opacity:.6}
+.card-thumb input[type=file]{position:absolute;inset:0;opacity:0;cursor:pointer;width:100%;height:100%}
+
+/* clear button */
+.clear-btn{
+    position:absolute;top:5px;right:5px;
+    background:rgba(13,15,20,.75);border:1px solid var(--brd);
+    color:var(--dim);font-size:.65rem;font-family:var(--mono);
+    padding:2px 6px;border-radius:3px;cursor:pointer;display:none;
+    transition:color .15s,border-color .15s;z-index:2;
+}
+.clear-btn:hover{color:var(--danger);border-color:var(--danger)}
+.dir-card.has-img .clear-btn{display:block}
+
+/* card body */
+.card-body{width:100%;padding:10px 10px 12px;display:flex;flex-direction:column;align-items:center;gap:8px}
+
+/* bússola compacta */
+.compass-wrap{cursor:pointer;position:relative}
+.compass-wrap svg{display:block}
+
+.card-dir-label{
+    font-family:var(--mono);font-size:.62rem;color:var(--dim);
+    letter-spacing:.07em;text-align:center
+}
+.card-dir-label strong{color:var(--warn);font-size:.75rem}
+
+/* presets */
+.presets{display:flex;gap:4px;flex-wrap:wrap;justify-content:center}
+.pbtn{
+    font-family:var(--mono);font-size:.58rem;padding:2px 7px;
+    background:transparent;border:1px solid var(--bhi);color:var(--dim);
+    border-radius:3px;cursor:pointer;transition:border-color .15s,color .15s
+}
+.pbtn:hover{border-color:var(--acc);color:var(--acc)}
+.pbtn.sel{border-color:var(--warn);color:var(--warn);background:rgba(244,185,66,.08)}
+
+/* filename badge */
+.fname{
+    font-family:var(--mono);font-size:.57rem;color:var(--grn);
+    text-align:center;padding:0 4px;word-break:break-all;
+    max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:none
+}
+.dir-card.has-img .fname{display:block}
+
+/* ──────────────────────────
+   PARÂMETROS (câmara + luz)
+────────────────────────── */
+.params-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+.params-grid2{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:10px}
+.fld label{display:block;font-family:var(--mono);font-size:.6rem;color:var(--dim);margin-bottom:4px;letter-spacing:.06em}
+.fld input,.fld select{
+    width:100%;background:var(--surf2);border:1px solid var(--brd);
+    color:var(--text);font-family:var(--mono);font-size:.8rem;
+    padding:6px 8px;border-radius:4px;outline:none;transition:border-color .15s
+}
+.fld input:focus,.fld select:focus{border-color:var(--acc)}
+.chk{display:flex;align-items:center;gap:7px;padding-top:18px}
+.chk input{accent-color:var(--acc)}
+.chk span{font-size:.78rem}
+
+/* ROI badge */
+#roiBadge{
+    display:none;margin-top:10px;font-family:var(--mono);font-size:.68rem;
+    color:var(--grn);background:rgba(61,220,151,.07);
+    border:1px solid rgba(61,220,151,.2);border-radius:4px;padding:7px 11px
+}
+
+/* STATUS BAR dos 4 slots */
+#slotBar{
+    display:flex;gap:8px;align-items:center;padding:10px 0 2px;
+    font-family:var(--mono);font-size:.68rem;flex-wrap:wrap
+}
+.slot-dot{
+    display:inline-flex;align-items:center;gap:5px;
+    padding:3px 9px;border-radius:3px;border:1px solid var(--brd);
+    color:var(--dim);transition:all .2s
+}
+.slot-dot.ok{border-color:var(--grn);color:var(--grn);background:rgba(61,220,151,.07)}
+
+/* BTN */
+.btn{font-family:var(--mono);font-size:.76rem;font-weight:600;letter-spacing:.06em;
+     padding:9px 20px;border:1.5px solid;border-radius:4px;cursor:pointer;
+     transition:opacity .15s,transform .1s}
+.btn:active{transform:scale(.97)}
+.btn-primary{background:var(--acc);border-color:var(--acc);color:#0d0f14}
+.btn-ghost{background:transparent;border-color:var(--bhi);color:var(--dim)}
+.btn-ghost:hover{border-color:var(--warn);color:var(--warn)}
+.btn:disabled{opacity:.3;cursor:not-allowed}
+.btn-row{display:flex;gap:10px;margin-top:16px;flex-wrap:wrap;align-items:center}
+
+/* RESULTS */
+.res-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-top:8px}
+.res-item{background:var(--surf2);border:1px solid var(--brd);border-radius:4px;overflow:hidden}
+.res-item img{width:100%;display:block;aspect-ratio:1;object-fit:cover}
+.res-lbl{font-family:var(--mono);font-size:.6rem;color:var(--dim);padding:7px 9px;letter-spacing:.06em;text-transform:uppercase}
+.res-lbl strong{display:block;color:var(--text);font-size:.73rem;margin-bottom:2px}
+
+/* LOADING */
+#loadingOverlay{display:none;position:fixed;inset:0;background:rgba(13,15,20,.9);
+    backdrop-filter:blur(4px);z-index:100;flex-direction:column;align-items:center;
+    justify-content:center;gap:16px}
+#loadingOverlay.vis{display:flex}
+.spinner{width:32px;height:32px;border:2px solid var(--brd);border-top-color:var(--acc);
+         border-radius:50%;animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+#loadingMsg{font-family:var(--mono);font-size:.75rem;color:var(--dim)}
+
+/* NOTIF */
+#notif{position:fixed;bottom:20px;right:20px;background:var(--surf2);
+       border:1px solid var(--bhi);border-radius:4px;padding:8px 13px;
+       font-family:var(--mono);font-size:.7rem;color:var(--danger);
+       transform:translateY(60px);opacity:0;transition:transform .3s,opacity .3s;z-index:200}
+#notif.vis{transform:translateY(0);opacity:1}
+
+@media(max-width:680px){
+    .dir-grid{grid-template-columns:1fr 1fr}
+    .params-grid,.params-grid2{grid-template-columns:1fr 1fr}
+    .res-grid{grid-template-columns:1fr}
+}
+</style>
+</head>
+<body>
+
+<div id="loadingOverlay"><div class="spinner"></div><p id="loadingMsg">Processando...</p></div>
+<div id="notif"></div>
+
+<header>
+    <h1>PHOTOSTEREO//BLENDER</h1>
+    <span>CÂMARA ORTOGONAL · ROI AUTO · ASSOCIAÇÃO VISUAL LUZ→IMAGEM · v4.1</span>
+</header>
+
+<div id="stepper">
+    <div class="step ativo" id="st0"><span class="sn">01</span>SETUP + IMAGENS</div>
+    <div class="step"       id="st1"><span class="sn">02</span>RESULTADO</div>
+</div>
+
+<!-- ══════════════════════ PAINEL SETUP ══════════════════════ -->
+<div class="painel" id="painelSetup">
+    <p class="ptitle">// 01 · associar imagem a cada direção de luz</p>
+
+    <!-- 4 CARDS ────────────────────────────────────────────── -->
+    <div class="dir-grid" id="dirGrid"></div>
+
+    <!-- STATUS DOS 4 SLOTS -->
+    <div id="slotBar"></div>
+
+    <!-- PARÂMETROS DA CÂMARA ─────────────────────────────── -->
+    <p class="sec">câmara blender
+        <span style="color:var(--grn);font-weight:normal;letter-spacing:0">
+            — valores iguais ao painel Camera no Blender
+        </span>
+    </p>
+    <div class="params-grid">
+        <div class="fld">
+            <label>FOCAL LENGTH (mm)</label>
+            <input type="number" id="cfgFocal"  value="50"  min="1"    max="1000" step="0.1" oninput="atualizarROI()">
+        </div>
+        <div class="fld">
+            <label>SENSOR WIDTH (mm)</label>
+            <input type="number" id="cfgSensor" value="36"  min="1"    max="200"  step="0.1" oninput="atualizarROI()">
+        </div>
+        <div class="fld">
+            <label>ALTURA CÂMARA — Z (m)
+                <span style="color:var(--warn);font-size:.55rem">Blender Z = 1.07 m</span>
+            </label>
+            <input type="number" id="cfgCamH"   value="1.07" min="0.01" max="100" step="0.001" oninput="atualizarROI()">
+        </div>
+    </div>
+
+    <!-- PARÂMETROS DA BANCADA ────────────────────────────── -->
+    <p class="sec">bancada (área de trabalho) — em metros</p>
+    <div class="params-grid">
+        <div class="fld">
+            <label>LARGURA (m)</label>
+            <input type="number" id="cfgWbLarg" value="1.0"  min="0.01" max="50"  step="0.01" oninput="atualizarROI()">
+        </div>
+        <div class="fld">
+            <label>PROFUNDIDADE (m)</label>
+            <input type="number" id="cfgWbProf" value="0.6"  min="0.01" max="50"  step="0.01" oninput="atualizarROI()">
+        </div>
+    </div>
+    <div id="roiBadge"></div>
+
+    <!-- PARÂMETROS DA LUZ ───────────────────────────────── -->
+    <p class="sec">geometria da luz — em metros</p>
+    <div class="params-grid">
+        <div class="fld">
+            <label>ALTURA LUZ h (m)</label>
+            <input type="number" id="cfgH" value="0.025" min="0.001" max="5"   step="0.001">
+        </div>
+        <div class="fld">
+            <label>DISTÂNCIA HORIZONTAL d (m)</label>
+            <input type="number" id="cfgD" value="0.1"   min="0.001" max="10"  step="0.001">
+        </div>
+    </div>
+
+    <!-- OPÇÕES ─────────────────────────────────────────── -->
+    <p class="sec">processamento</p>
+    <div class="params-grid2">
+        <div class="fld">
+            <label>INTEGRADOR DE DEPTH</label>
+            <select id="cfgMetodo">
+                <option value="poisson">Poisson / DCT (recomendado)</option>
+                <option value="frankot">Frankot-Chellappa</option>
+            </select>
+        </div>
+        <div class="fld">
+            <label>SENSIBILIDADE DA MÁSCARA
+                <span style="color:var(--dim);font-size:.55rem">↑ = menos ruído, ↓ = mais área</span>
+            </label>
+            <input type="number" id="cfgThresh" value="0.04" min="0.005" max="0.3" step="0.005"
+                   title="Threshold de variação entre imagens. Aumente se houver artefatos no fundo.">
+        </div>
+        <div class="fld">
+            <div class="chk">
+                <input type="checkbox" id="cfgSuavizar">
+                <span>Suavizar normais (σ=1)</span>
+            </div>
+        </div>
+    </div>
+
+    <div class="btn-row">
+        <button class="btn btn-primary" id="btnProcessar" onclick="processar()" disabled>▶ PROCESSAR</button>
+        <button class="btn btn-ghost"   onclick="location.reload()">REINICIAR</button>
+        <span id="btnHint" style="font-family:var(--mono);font-size:.65rem;color:var(--dim);margin-left:4px"></span>
+    </div>
+</div>
+
+<!-- ══════════════════════ PAINEL RESULTADO ══════════════════ -->
+<div class="painel" id="painelRes" style="display:none">
+    <p class="ptitle">// resultados</p>
+    <div class="res-grid">
+        <div class="res-item">
+            <img id="imgNormal" src="" alt="Normal Map">
+            <div class="res-lbl"><strong>Normal Map</strong>RGB tangent-space · +X+Y+Z</div>
+        </div>
+        <div class="res-item">
+            <img id="imgDepth" src="" alt="Depth Map">
+            <div class="res-lbl"><strong>Depth Map</strong>Integração por gradientes</div>
+        </div>
+        <div class="res-item">
+            <img id="imgAlbedo" src="" alt="Albedo">
+            <div class="res-lbl"><strong>Albedo Map</strong>Reflectância difusa ρ</div>
+        </div>
+    </div>
+    <div class="btn-row" style="margin-top:16px">
+        <button class="btn btn-ghost" onclick="location.reload()">← NOVA SESSÃO</button>
+    </div>
+</div>
+
+
+<script>
+// ════════════════════════════════════════════════════════════
+// ESTADO
+// ════════════════════════════════════════════════════════════
+
+// Definições de cada slot (pode editar labels/ângulos)
+const DIRS = [
+    { id: 'N', label: 'Norte',  ang: 0,   color: '#4a9eff' },
+    { id: 'E', label: 'Leste',  ang: 90,  color: '#3ddc97' },
+    { id: 'S', label: 'Sul',    ang: 180, color: '#f4b942' },
+    { id: 'W', label: 'Oeste',  ang: 270, color: '#a78bfa' },
+];
+
+// Estado por slot: { file: File|null, objectUrl: string|null, ang: number }
+const slots = DIRS.map(d => ({ file: null, objectUrl: null, ang: d.ang }));
+
+// ════════════════════════════════════════════════════════════
+// BUILD CARDS
+// ════════════════════════════════════════════════════════════
+function buildCards() {
+    const grid = document.getElementById('dirGrid');
+    grid.innerHTML = '';
+
+    DIRS.forEach((dir, i) => {
+        const card = document.createElement('div');
+        card.className = 'dir-card';
+        card.id = `card${i}`;
+
+        card.innerHTML = `
+            <!-- thumbnail + file input -->
+            <div class="card-thumb" id="thumb${i}" onclick="document.getElementById('inp${i}').click()">
+                <input type="file" id="inp${i}" accept="image/*" style="display:none"
+                       onchange="onFileSelected(${i}, this)">
+                <img id="timg${i}" src="" alt="">
+                <div class="thumb-placeholder" id="ph${i}">
+                    <span class="add-icon">+</span>
+                    <span>Clique ou arraste</span>
+                    <span style="color:var(--acc);margin-top:2px">${dir.id}</span>
+                </div>
+            </div>
+            <button class="clear-btn" onclick="clearSlot(${i})">✕</button>
+
+            <div class="card-body">
+                <!-- bússola -->
+                <div class="compass-wrap" id="cw${i}" onclick="onCompassClick(event,${i})">
+                    ${svgCompass(i, slots[i].ang, dir.color)}
+                </div>
+
+                <!-- label direção + presets -->
+                <div class="card-dir-label" id="dlabel${i}">
+                    <strong>${dir.id} · ${slots[i].ang}°</strong><br>
+                    <span style="font-size:.58rem;color:var(--dim)">${dir.label}</span>
+                </div>
+
+                <div class="presets" id="presets${i}">
+                    ${DIRS.map(d =>
+                        `<button class="pbtn${slots[i].ang===d.ang?' sel':''}"
+                                 onclick="setAng(${i},${d.ang})">${d.id}</button>`
+                    ).join('')}
+                </div>
+
+                <div class="fname" id="fname${i}"></div>
+            </div>`;
+
+        // Drag & drop no card inteiro
+        card.addEventListener('dragover',  e => { e.preventDefault(); card.classList.add('drag-over'); });
+        card.addEventListener('dragleave', () => card.classList.remove('drag-over'));
+        card.addEventListener('drop', e => {
+            e.preventDefault(); card.classList.remove('drag-over');
+            const file = e.dataTransfer.files[0];
+            if (file && file.type.startsWith('image/')) applyFile(i, file);
+        });
+
+        grid.appendChild(card);
+    });
+
+    updateSlotBar();
+    updateBtn();
+}
+
+// ════════════════════════════════════════════════════════════
+// SVG BÚSSOLA
+// ════════════════════════════════════════════════════════════
+function svgCompass(idx, ang, dotColor) {
+    const R = 32, r = 21;
+    const rad  = (ang - 90) * Math.PI / 180;
+    const dotX = (r * Math.cos(rad)).toFixed(1);
+    const dotY = (r * Math.sin(rad)).toFixed(1);
+    const lx2  = ((r+1) * Math.cos(rad)).toFixed(1);
+    const ly2  = ((r+1) * Math.sin(rad)).toFixed(1);
+    const vb   = R + 8;
+    return `<svg id="csvg${idx}" viewBox="-${vb} -${vb} ${vb*2} ${vb*2}" width="74" height="74">
+        <circle r="${R}" fill="rgba(13,15,20,.4)" stroke="var(--brd)" stroke-width="1"/>
+        <circle r="2" fill="var(--dim)" opacity=".5"/>
+        <text x="0" y="-${R-5}" text-anchor="middle" font-family="IBM Plex Mono,monospace" font-size="7" fill="var(--dim)">N</text>
+        <text x="${R-4}" y="3"   text-anchor="middle" font-family="IBM Plex Mono,monospace" font-size="7" fill="var(--dim)">E</text>
+        <text x="0" y="${R-3}"   text-anchor="middle" font-family="IBM Plex Mono,monospace" font-size="7" fill="var(--dim)">S</text>
+        <text x="-${R-4}" y="3"  text-anchor="middle" font-family="IBM Plex Mono,monospace" font-size="7" fill="var(--dim)">W</text>
+        <line x1="0" y1="0" x2="${lx2}" y2="${ly2}" stroke="${dotColor}" stroke-width="1.5" opacity=".8"/>
+        <circle cx="${dotX}" cy="${dotY}" r="5" fill="${dotColor}" stroke="var(--bg)" stroke-width="1.5"/>
+    </svg>`;
+}
+
+function onCompassClick(e, i) {
+    const svg  = document.getElementById(`csvg${i}`);
+    const rect = svg.getBoundingClientRect();
+    const cx   = rect.left + rect.width  / 2;
+    const cy   = rect.top  + rect.height / 2;
+    let ang    = Math.round(Math.atan2(e.clientX - cx, -(e.clientY - cy)) * 180 / Math.PI);
+    if (ang < 0) ang += 360;
+    setAng(i, ang);
+}
+
+function setAng(i, ang) {
+    slots[i].ang = ((ang % 360) + 360) % 360;
+    // Re-render bússola + label + presets
+    document.getElementById(`cw${i}`).innerHTML = svgCompass(i, slots[i].ang, DIRS[i].color);
+    document.getElementById(`cw${i}`).onclick = e => onCompassClick(e, i);
+    document.getElementById(`dlabel${i}`).innerHTML =
+        `<strong>${DIRS[i].id} · ${slots[i].ang}°</strong><br>
+         <span style="font-size:.58rem;color:var(--dim)">${DIRS[i].label}</span>`;
+    document.getElementById(`presets${i}`).innerHTML = DIRS.map(d =>
+        `<button class="pbtn${slots[i].ang===d.ang?' sel':''}"
+                 onclick="setAng(${i},${d.ang})">${d.id}</button>`
+    ).join('');
+}
+
+// ════════════════════════════════════════════════════════════
+// FILE HANDLING
+// ════════════════════════════════════════════════════════════
+function onFileSelected(i, input) {
+    if (input.files[0]) applyFile(i, input.files[0]);
+}
+
+function applyFile(i, file) {
+    if (slots[i].objectUrl) URL.revokeObjectURL(slots[i].objectUrl);
+    slots[i].file = file;
+    slots[i].objectUrl = URL.createObjectURL(file);
+
+    const timg = document.getElementById(`timg${i}`);
+    timg.src   = slots[i].objectUrl;
+    timg.style.display = 'block';
+    document.getElementById(`ph${i}`).style.display = 'none';
+    document.getElementById(`card${i}`).classList.add('has-img');
+    document.getElementById(`fname${i}`).textContent = file.name;
+
+    updateSlotBar();
+    updateBtn();
+}
+
+function clearSlot(i) {
+    if (slots[i].objectUrl) URL.revokeObjectURL(slots[i].objectUrl);
+    slots[i].file = null; slots[i].objectUrl = null;
+    const timg = document.getElementById(`timg${i}`);
+    timg.src = ''; timg.style.display = 'none';
+    document.getElementById(`ph${i}`).style.display = 'flex';
+    document.getElementById(`card${i}`).classList.remove('has-img');
+    document.getElementById(`fname${i}`).textContent = '';
+    document.getElementById(`inp${i}`).value = '';
+    updateSlotBar(); updateBtn();
+}
+
+// ════════════════════════════════════════════════════════════
+// STATUS BAR
+// ════════════════════════════════════════════════════════════
+function updateSlotBar() {
+    const bar = document.getElementById('slotBar');
+    bar.innerHTML = slots.map((s, i) =>
+        `<span class="slot-dot${s.file ? ' ok' : ''}">
+            <span style="color:${DIRS[i].color}">${DIRS[i].id}</span>
+            ${s.file ? '✓ ' + truncName(s.file.name) : '— sem imagem'}
+        </span>`
+    ).join('');
+}
+
+function truncName(n) {
+    return n.length > 18 ? n.slice(0,15) + '…' : n;
+}
+
+function updateBtn() {
+    const ok = slots.every(s => s.file !== null);
+    document.getElementById('btnProcessar').disabled = !ok;
+    document.getElementById('btnHint').textContent =
+        ok ? '' : `${slots.filter(s=>s.file).length}/4 imagens associadas`;
+}
+
+// ════════════════════════════════════════════════════════════
+// ROI PREVIEW
+// ════════════════════════════════════════════════════════════
+function atualizarROI() {
+    const focal  = parseFloat(document.getElementById('cfgFocal').value)  || 50;
+    const sensor = parseFloat(document.getElementById('cfgSensor').value) || 36;
+    const camH_m = parseFloat(document.getElementById('cfgCamH').value)   || 1.07;
+    const wbL_m  = parseFloat(document.getElementById('cfgWbLarg').value) || 1.0;
+    const wbP_m  = parseFloat(document.getElementById('cfgWbProf').value) || 0.6;
+
+    // Converter para mm para a fórmula
+    const camH = camH_m * 1000;
+    const wbL  = wbL_m  * 1000;
+    const wbP  = wbP_m  * 1000;
+
+    const physW = camH * sensor / focal;
+    const physH = physW * (wbP / wbL);
+    const rX    = Math.min(wbL / physW * 100, 100).toFixed(0);
+    const rY    = Math.min(wbP / physH * 100, 100).toFixed(0);
+
+    const badge = document.getElementById('roiBadge');
+    badge.style.display = 'block';
+    badge.innerHTML =
+        `Campo visível: <strong>${(physW/1000).toFixed(2)} × ${(physH/1000).toFixed(2)} m</strong> ` +
+        `→ bancada ocupa ≈ <strong>${rX}%</strong> × <strong>${rY}%</strong> da imagem`;
+}
+
+// ════════════════════════════════════════════════════════════
+// VETORES DE LUZ
+// ════════════════════════════════════════════════════════════
+function calcVetor(angGraus, h, d) {
+    const rad = angGraus * Math.PI / 180;
+    const lx = d * Math.sin(rad), ly = d * Math.cos(rad), lz = h;
+    const mag = Math.sqrt(lx*lx + ly*ly + lz*lz);
+    return [lx/mag, ly/mag, lz/mag];
+}
+
+// ════════════════════════════════════════════════════════════
+// PROCESSAR
+// ════════════════════════════════════════════════════════════
+async function processar() {
+    if (!slots.every(s => s.file)) return notif('Associe uma imagem a cada direção.');
+
+    // 1. Upload — preserva a ORDEM N→E→S→W
+    loading('Fazendo upload (N → E → S → W)...');
+    const fd = new FormData();
+    slots.forEach(s => fd.append('imagens', s.file));
+
+    let upData;
+    try {
+        const r = await fetch('/upload_imagens', { method:'POST', body: fd });
+        if (!r.ok) { const e = await r.json(); throw new Error(e.detail || 'Upload falhou'); }
+        upData = await r.json();
+    } catch(e) { stopLoading(); return notif(e.message); }
+
+    // 2. Processar
+    loading('Calculando normal map, depth e albedo...');
+    setStep(1);
+
+    const h_m = parseFloat(document.getElementById('cfgH').value) || 0.025;
+    const d_m = parseFloat(document.getElementById('cfgD').value) || 0.1;
+    // Vetores calculados com mm (mesma unidade relativa — só os ângulos importam)
+    const h = h_m * 1000, d = d_m * 1000;
+
+    const payload = {
+        arquivos:        upData.arquivos,
+        vetores_luz:     slots.map(s => calcVetor(s.ang, h, d)),
+        focal_mm:        parseFloat(document.getElementById('cfgFocal').value)  || 50,
+        sensor_w_mm:     parseFloat(document.getElementById('cfgSensor').value) || 36,
+        // Converter metros → mm para o backend
+        camera_h_mm:     (parseFloat(document.getElementById('cfgCamH').value)   || 1.07) * 1000,
+        wb_larg_mm:      (parseFloat(document.getElementById('cfgWbLarg').value) || 1.0)  * 1000,
+        wb_prof_mm:      (parseFloat(document.getElementById('cfgWbProf').value) || 0.6)  * 1000,
+        metodo_depth:    document.getElementById('cfgMetodo').value,
+        suavizar_normais: document.getElementById('cfgSuavizar').checked,
+        thresh_variacao: parseFloat(document.getElementById('cfgThresh').value)  || 0.04,
+    };
+
+    let data;
+    try {
+        const r = await fetch('/processar', {
+            method:'POST', headers:{'Content-Type':'application/json'},
+            body: JSON.stringify(payload)
+        });
+        if (!r.ok) { const e = await r.json(); throw new Error(e.detail || 'Processamento falhou'); }
+        data = await r.json();
+    } catch(e) { stopLoading(); setStep(0); return notif(e.message); }
+
+    stopLoading();
+    const ts = '?t=' + Date.now();
+    document.getElementById('imgNormal').src = data.normal_url + ts;
+    document.getElementById('imgDepth').src  = data.depth_url  + ts;
+    document.getElementById('imgAlbedo').src = data.albedo_url + ts;
+    document.getElementById('painelSetup').style.display = 'none';
+    document.getElementById('painelRes').style.display   = 'block';
+    setStep(1);
+}
+
+// ════════════════════════════════════════════════════════════
+// HELPERS
+// ════════════════════════════════════════════════════════════
+function setStep(n) {
+    document.querySelectorAll('.step').forEach((el, i) => {
+        el.classList.toggle('ativo', i === n);
+        el.classList.toggle('ok',   i < n);
+    });
+}
+function loading(msg) {
+    document.getElementById('loadingMsg').textContent = msg;
+    document.getElementById('loadingOverlay').classList.add('vis');
+}
+function stopLoading() { document.getElementById('loadingOverlay').classList.remove('vis'); }
+function notif(msg) {
+    const el = document.getElementById('notif');
+    el.textContent = msg; el.classList.add('vis');
+    setTimeout(() => el.classList.remove('vis'), 3500);
+}
+
+// Init
+buildCards();
+atualizarROI();
+</script>
+</body>
+</html>

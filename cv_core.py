@@ -16,7 +16,9 @@ import numpy as np
 import os
 from scipy.ndimage import gaussian_filter
 from scipy.fft import dctn, idctn
+from fastapi import FastAPI
 
+app = FastAPI() 
 
 # ==============================================================
 # MÓDULO 1 — VETOR DE LUZ POR GEOMETRIA
@@ -404,3 +406,4 @@ def processar_mapas(
     cv2.imwrite(p_albedo, albedo_vis)
 
     return 'resultado_normal.png', 'resultado_depth.png', 'resultado_albedo.png'
+
