@@ -129,25 +129,46 @@ def load_and_flatten(filepath: str) -> np.ndarray:
 
 
 def subtrair_luz_ambiente(imgs: list[np.ndarray],
-                           mascara_roi: np.ndarray | None = None,
-                           percentil: int = 2) -> list[np.ndarray]:
-    resultado = []
-    for img in imgs:
-        regiao = img[mascara_roi] if (mascara_roi is not None and mascara_roi.any()) else img.ravel()
-        nivel  = np.percentile(regiao, percentil)
-        resultado.append(np.clip(img - nivel, 0.0, 1.0))
-    return resultado
+                           mascara_roi: np.ndarray | None = None) -> list[np.ndarray]:
+    """
+    Remove a componente de luz ambiente pixel a pixel.
+
+    Método: min(I1, I2, I3, I4) em cada pixel — é a melhor estimativa possível
+    da luz ambiente, pois em pelo menos uma das 4 direções o pixel recebe
+    somente a componente difusa mínima (ou está em sombra).
+
+    Muito mais eficaz do que um percentil global para renders Blender onde
+    a iluminação ambiente do World pode variar pela cena.
+    """
+    stack    = np.stack(imgs, axis=0)          # (N, H, W)
+    ambiente = np.min(stack, axis=0)           # mínimo pixel-a-pixel entre as N imagens
+    return [np.clip(img - ambiente, 0.0, 1.0) for img in imgs]
 
 
 def criar_mascara_valida(imgs: list[np.ndarray],
-                          mascara_roi: np.ndarray | None = None,
-                          thresh_sombra: float = 0.03,
-                          thresh_sat:    float = 0.97) -> np.ndarray:
-    mascara = np.ones(imgs[0].shape, dtype=bool)
+                          mascara_roi:      np.ndarray | None = None,
+                          thresh_variacao:  float = 0.04,
+                          thresh_sat:       float = 0.95) -> np.ndarray:
+    """
+    Pixel válido = apresenta variação real entre as 4 imagens.
+
+    std(I1..IN) > thresh_variacao garante que o pixel foi efetivamente
+    iluminado de formas diferentes e não está:
+      - sempre em sombra (std ≈ 0, baixo)
+      - sempre saturado  (std ≈ 0, alto)
+      - num shadow cast de outro objeto (variação mínima)
+
+    Isto substitui o threshold absoluto anterior que excluía pixels
+    escuros legítimos e deixava passar pixels com sombra constante.
+    """
+    stack    = np.stack(imgs, axis=0)          # (N, H, W)
+    variacao = np.std(stack, axis=0)           # desvio padrão por pixel
+
+    mascara = variacao > thresh_variacao
     if mascara_roi is not None:
         mascara &= mascara_roi
+    # Excluir saturados em qualquer das imagens
     for img in imgs:
-        mascara &= (img > thresh_sombra)
         mascara &= (img < thresh_sat)
     return mascara
 
@@ -237,6 +258,11 @@ def processar_mapas(
     metodo_depth:      str   = 'poisson',
     suavizar_normais:  bool  = False,
     sigma_suavizacao:  float = 1.0,
+    # Controle de qualidade da máscara:
+    # Aumente thresh_variacao (ex: 0.08) se aparecerem artefatos no fundo.
+    # Diminua (ex: 0.02) se objetos de cor uniforme sumam da máscara.
+    thresh_variacao:   float = 0.04,
+    thresh_sat:        float = 0.95,
 ) -> tuple[str, str, str]:
     """
     Pipeline completo de Estéreo Fotométrico.
@@ -276,13 +302,18 @@ def processar_mapas(
 
     # ── 3. PRÉ-PROCESSAMENTO ────────────────────────────────
     imgs    = subtrair_luz_ambiente(imgs, mascara_roi)
-    mascara = criar_mascara_valida(imgs, mascara_roi)
+    mascara = criar_mascara_valida(imgs, mascara_roi,
+                                   thresh_variacao=thresh_variacao,
+                                   thresh_sat=thresh_sat)
     idx_val = np.where(mascara.flatten())[0]
+
+    pct_val = 100.0 * len(idx_val) / (altura * largura)
+    print(f"  [mask] {len(idx_val)} px válidos ({pct_val:.1f}% da imagem)")
 
     if len(idx_val) == 0:
         raise ValueError(
             "Nenhum pixel válido após mascaramento. "
-            "Verifique os parâmetros da câmara/bancada."
+            "Reduza thresh_variacao ou verifique os parâmetros da câmara/bancada."
         )
 
     # ── 4. VETORES DE LUZ ───────────────────────────────────
@@ -336,19 +367,24 @@ def processar_mapas(
     p_grad  = np.clip(-nx / nz_safe, -10.0, 10.0)
     q_grad  = np.clip(-ny / nz_safe, -10.0, 10.0)
 
-    if mascara_roi is not None:
-        p_grad[~mascara] = 0.0
-        q_grad[~mascara] = 0.0
+    # Forçar gradientes a zero fora da máscara para não contaminar a integração
+    p_grad[~mascara] = 0.0
+    q_grad[~mascara] = 0.0
 
     depth_raw = poisson_depth(p_grad, q_grad) if metodo_depth == 'poisson' \
                 else frankot_chellappa(p_grad, q_grad)
 
-    reg_m  = mascara if mascara.any() else np.ones_like(mascara)
-    d_min  = np.percentile(depth_raw[reg_m], 2)
-    d_max  = np.percentile(depth_raw[reg_m], 98)
-    depth_vis = np.clip(
+    reg_m = mascara if mascara.any() else np.ones_like(mascara)
+    d_min = np.percentile(depth_raw[reg_m], 2)
+    d_max = np.percentile(depth_raw[reg_m], 98)
+    depth_norm = np.clip(
         (depth_raw - d_min) / (d_max - d_min + 1e-9) * 255.0, 0, 255
     ).astype(np.uint8)
+
+    # Suavização leve do depth final (σ=1) para reduzir ruído de integração
+    # sem distorcer as normais — só aplicada dentro da máscara válida
+    depth_smooth = cv2.GaussianBlur(depth_norm, (5, 5), sigmaX=1.0)
+    depth_vis    = np.where(reg_m, depth_smooth, depth_norm)
 
     # ── 10. ALBEDO MAP ──────────────────────────────────────
     albedo_2d = albedo_flat.reshape(altura, largura)
