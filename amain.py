@@ -1,11 +1,11 @@
 """
-amain.py — Servidor FastAPI · Modo Blender (câmara ortogonal fixa)
+amain.py — Servidor FastAPI · Modo Blender
 
-Diferenças em relação à versão anterior:
-  • CalibracaoData não tem mais o campo `plano` (4 cantos manuais).
-  • Novos campos: wb_larg_mm, wb_prof_mm, camera_h_mm, focal_mm, sensor_w_mm.
-  • processar_mapas() é chamado com camera_ortogonal=True →
-    ROI auto-calculada, homografia/rotação omitidas.
+Versão 5.0 — Novos campos em CalibracaoData:
+  • ortho_scale_mm  : Orthographic Scale do Blender em mm (câmara ortográfica real).
+  • detectar_sombra : ativa/desativa detecção de sombra cast (padrão: True).
+  • thresh_sombra_cast : sensibilidade da detecção (0.20=agressivo, 0.50=suave).
+  • raio_contexto_px   : raio do filtro de contexto vizinho para detecção.
 
 Execução:
     pip install fastapi uvicorn python-multipart
@@ -19,7 +19,7 @@ import shutil
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 import cv_core
 from fastapi import FastAPI, File, HTTPException, UploadFile
@@ -32,14 +32,13 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("photostereo")
 
-DIR_STATIC     = Path("static")
-DIR_UPLOADS    = Path("uploads")
-
+DIR_STATIC  = Path("static")
+DIR_UPLOADS = Path("uploads")
 for d in (DIR_STATIC, DIR_UPLOADS):
     d.mkdir(exist_ok=True)
 
 _executor = ThreadPoolExecutor(max_workers=2)
-app       = FastAPI(title="PhotoStereo Blender", version="4.0")
+app       = FastAPI(title="PhotoStereo Blender", version="5.0")
 
 app.mount("/static",  StaticFiles(directory=DIR_STATIC),  name="static")
 app.mount("/uploads", StaticFiles(directory=DIR_UPLOADS), name="uploads")
@@ -50,27 +49,45 @@ app.mount("/uploads", StaticFiles(directory=DIR_UPLOADS), name="uploads")
 # ──────────────────────────────────────────────────────────────
 
 class CalibracaoData(BaseModel):
-    """
-    Payload do frontend.
-    Sem `plano`: a ROI é calculada automaticamente dos parâmetros da câmara.
-    """
-    arquivos:        List[str]
-    vetores_luz:     List[List[float]]
+    arquivos:     List[str]
+    vetores_luz:  List[List[float]]
 
     # ── Câmara Blender ───────────────────────────────────────
-    focal_mm:        float = Field(50.0,  gt=0, description="Focal length (mm)")
-    sensor_w_mm:     float = Field(36.0,  gt=0, description="Sensor width (mm)")
-    camera_h_mm:     float = Field(1000.0,gt=0, description="Altura da câmara acima da bancada (mm)")
+    focal_mm:        float         = Field(50.0,   gt=0,
+        description="Focal length (mm) — só usado no modo perspectiva (fallback)")
+    sensor_w_mm:     float         = Field(36.0,   gt=0,
+        description="Sensor width (mm) — só usado no modo perspectiva (fallback)")
+    camera_h_mm:     float         = Field(1000.0, gt=0,
+        description="Altura da câmara acima da bancada (mm)")
+    ortho_scale_mm:  Optional[float] = Field(814.286, gt=0,
+        description="Orthographic Scale do Blender convertido em mm "
+                    "(ex: Blender mostra 1.28 → passe 1280). "
+                    "Se fornecido, usa cálculo ortográfico correto ignorando focal/sensor/altura.")
 
     # ── Bancada ──────────────────────────────────────────────
-    wb_larg_mm:      float = Field(1000.0, gt=0, description="Largura da bancada (mm)")
-    wb_prof_mm:      float = Field(600.0,  gt=0, description="Profundidade da bancada (mm)")
+    wb_larg_mm: float = Field(1000.0, gt=0, description="Largura da bancada (mm)")
+    wb_prof_mm: float = Field(600.0,  gt=0, description="Profundidade da bancada (mm)")
 
     # ── Opções de processamento ──────────────────────────────
-    metodo_depth:    str  = "poisson"
+    metodo_depth:     str  = "poisson"
     suavizar_normais: bool = False
-    thresh_variacao: float = Field(0.04, ge=0.001, le=0.5,
-        description="Sensibilidade da máscara. Aumente para reduzir ruído; diminua para cobrir mais área.")
+    razao_sombra:     float = Field(0.60, ge=0.1, le=1.0,
+        description="Drop-darkest: descarta luz se min < X*mediana (sombra própria)")
+    thresh_residuo:   float = Field(0.20, ge=0.05, le=1.0,
+        description="Rejeição por resíduo: máximo tolerado (0.10=agressivo, 0.40=suave)")
+    thresh_variacao:  float = Field(0.04, ge=0.001, le=0.5,
+        description="Sensibilidade da máscara de variação")
+
+    # ── Detecção de sombra cast ──────────────────────────────
+    detectar_sombra:    bool  = Field(True,
+        description="Ativa detecção de sombras cast (projetadas por outros objetos). "
+                    "Recomendado manter True para cenas com múltiplos objetos.")
+    thresh_sombra_cast: float = Field(0.35, ge=0.10, le=0.90,
+        description="Sensibilidade da detecção de sombra cast por inconsistência de normais. "
+                    "Menor = remove mais pixels de sombra. 0.20=agressivo, 0.50=suave.")
+    raio_contexto_px:   int   = Field(5, ge=2, le=20,
+        description="Raio do filtro de contexto para detecção de sombra cast (pixels). "
+                    "Aumente para objetos grandes; reduza para detalhes pequenos.")
 
     @field_validator("arquivos")
     @classmethod
@@ -83,7 +100,7 @@ class CalibracaoData(BaseModel):
     @classmethod
     def validar_vetores(cls, v):
         if len(v) != 4:
-            raise ValueError(f"Esperado 4 vetores de luz, recebido {len(v)}.")
+            raise ValueError(f"Esperado 4 vetores, recebido {len(v)}.")
         for i, vec in enumerate(v):
             if len(vec) != 3:
                 raise ValueError(f"Vetor {i} deve ter 3 componentes [Lx, Ly, Lz].")
@@ -111,10 +128,8 @@ async def read_index():
 
 @app.post("/upload_imagens")
 async def upload_imagens(imagens: List[UploadFile] = File(...)):
-    """Recebe as 4 imagens, salva com UUID e devolve os nomes."""
     if len(imagens) != 4:
         raise HTTPException(400, detail=f"Envie exatamente 4 imagens. Recebido: {len(imagens)}.")
-
     arquivos_salvos = []
     for img in imagens:
         extensao   = Path(img.filename).suffix.lower() or ".jpg"
@@ -124,44 +139,49 @@ async def upload_imagens(imagens: List[UploadFile] = File(...)):
             shutil.copyfileobj(img.file, buf)
         arquivos_salvos.append(nome_unico)
         log.info(f"Upload: {nome_unico}  (original: {img.filename})")
-
     return {"arquivos": arquivos_salvos}
 
 
 @app.post("/processar")
 async def processar_dados(dados: CalibracaoData):
-    """
-    Executa o pipeline de Estéreo Fotométrico no modo Blender.
-    ROI calculada automaticamente; sem homografia.
-    """
     caminhos = []
     for nome in dados.arquivos:
         p = DIR_UPLOADS / nome
         if not p.exists():
-            raise HTTPException(404, detail=f"Arquivo não encontrado: {nome}. Faça o upload novamente.")
+            raise HTTPException(404, detail=f"Arquivo não encontrado: {nome}.")
         caminhos.append(str(p))
 
     def _executar_cv():
         return cv_core.processar_mapas(
-            caminhos_imagens = caminhos,
-            vetores_luz      = dados.vetores_luz,
-            diretorio_saida  = str(DIR_STATIC),
-            # ── Modo Blender ────────────────────────────────
-            camera_ortogonal = True,
-            wb_larg_mm       = dados.wb_larg_mm,
-            wb_prof_mm       = dados.wb_prof_mm,
-            camera_h_mm      = dados.camera_h_mm,
-            focal_mm         = dados.focal_mm,
-            sensor_w_mm      = dados.sensor_w_mm,
-            # ── Opções ──────────────────────────────────────
-            metodo_depth     = dados.metodo_depth,
-            suavizar_normais = dados.suavizar_normais,
-            thresh_variacao  = dados.thresh_variacao,
+            caminhos_imagens    = caminhos,
+            vetores_luz         = dados.vetores_luz,
+            diretorio_saida     = str(DIR_STATIC),
+            # ── Câmara ──────────────────────────────────────
+            camera_ortogonal    = True,
+            wb_larg_mm          = dados.wb_larg_mm,
+            wb_prof_mm          = dados.wb_prof_mm,
+            camera_h_mm         = dados.camera_h_mm,
+            focal_mm            = dados.focal_mm,
+            sensor_w_mm         = dados.sensor_w_mm,
+            ortho_scale_mm      = dados.ortho_scale_mm,
+            # ── Qualidade ───────────────────────────────────
+            metodo_depth        = dados.metodo_depth,
+            suavizar_normais    = dados.suavizar_normais,
+            thresh_variacao     = dados.thresh_variacao,
+            thresh_residuo      = dados.thresh_residuo,
+            razao_sombra        = dados.razao_sombra,
+            # ── Sombra cast ─────────────────────────────────
+            detectar_sombra     = dados.detectar_sombra,
+            thresh_sombra_cast  = dados.thresh_sombra_cast,
+            raio_contexto_px    = dados.raio_contexto_px,
         )
 
-    log.info(f"Processando | método={dados.metodo_depth} | "
-             f"câmara h={dados.camera_h_mm}mm f={dados.focal_mm}mm | "
-             f"bancada {dados.wb_larg_mm}×{dados.wb_prof_mm}mm")
+    log.info(
+        f"Processando | método={dados.metodo_depth} | "
+        f"ortho_scale={dados.ortho_scale_mm}mm | "
+        f"bancada {dados.wb_larg_mm}×{dados.wb_prof_mm}mm | "
+        f"sombra_cast={dados.detectar_sombra} thresh={dados.thresh_sombra_cast}"
+    )
 
     try:
         loop = asyncio.get_event_loop()

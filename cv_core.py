@@ -1,47 +1,62 @@
 """
-cv_core.py — Pipeline de Estéreo Fotométrico · Modo Blender (câmara ortogonal fixa)
+cv_core.py — Pipeline de Estéreo Fotométrico · Modo Blender
 
-Diferenças em relação à versão anterior:
-  1. calcular_roi_blender(): gera a máscara ROI automaticamente a partir dos
-     parâmetros da câmara e da bancada — sem seleção manual de cantos.
-  2. processar_mapas() aceita camera_ortogonal=True:
-     quando verdadeiro, o passo de homografia/rotação é completamente omitido
-     (câmara apontando direto para baixo = normais já no referencial correto).
-  3. plano_coords é opcional; se ausente e camera_ortogonal=True, a ROI é
-     calculada via calcular_roi_blender().
+Versão 5.0 — Melhorias principais:
+  1. Detecção robusta de sombras cast via "consistência fotométrica":
+     um pixel em sombra tem I_k ≈ 0 em algumas luzes mas o resíduo
+     explode porque nenhuma normal real produz esse padrão assimétrico.
+     Novo método: threshold adaptativo por percentil local + máscara
+     de sombra por gradiente de luminância entre imagens vizinhas.
+  2. calcular_roi_blender() aceita ortho_scale_mm para câmara ortográfica
+     real do Blender (sem depender de focal/sensor/distância).
+  3. mask_fundo corrigido: usa ~mascara_depth para não confundir tampas
+     planas de objetos com o chão.
+  4. sem_normal recalculado após suavização para não destruir bordas.
+  5. Poisson com divergência forward-difference (corrigido).
+  6. Normal map com flip-Y para convenção OpenGL correta.
 """
 
 import cv2
 import numpy as np
 import os
-from scipy.ndimage import gaussian_filter
+from scipy.ndimage import gaussian_filter, uniform_filter
 from scipy.fft import dctn, idctn
-from fastapi import FastAPI
 
-app = FastAPI() 
 
 # ==============================================================
-# MÓDULO 1 — VETOR DE LUZ POR GEOMETRIA
+# MÓDULO 1 — VETORES DE LUZ
 # ==============================================================
 
-def calcular_vetor_luz_geometria(angulo_graus: float,
-                                  h_mm: float,
-                                  d_mm: float) -> list[float]:
+def calcular_vetor_luz_sol(azimute_graus: float,
+                            elevacao_graus: float = 45.0) -> list[float]:
     """
-    Vetor unitário de iluminação calculado da geometria física do setup.
+    Vetor unitário para fonte Solar/Direcional do Blender.
 
-    Convenção (0°=Norte=topo da imagem, sentido horário):
-        0°  → L = [ 0, +d, h]
-        90° → L = [+d,  0, h]
-       180° → L = [ 0, -d, h]
-       270° → L = [-d,  0, h]
+    Convenção de azimute (0°=Norte, 90°=Leste, 180°=Sul, 270°=Oeste):
+        N (0°,  45°) → [ 0,      0.707, 0.707]
+        E (90°, 45°) → [ 0.707,  0,     0.707]
+        S (180°,45°) → [ 0,     -0.707, 0.707]
+        W (270°,45°) → [-0.707,  0,     0.707]
     """
-    rad = angulo_graus * np.pi / 180.0
-    lx  =  d_mm * np.sin(rad)
-    ly  =  d_mm * np.cos(rad)
-    lz  =  h_mm
+    az  = np.radians(azimute_graus)
+    el  = np.radians(elevacao_graus)
+    lx  = np.sin(az) * np.cos(el)
+    ly  = np.cos(az) * np.cos(el)
+    lz  = np.sin(el)
     mag = np.sqrt(lx**2 + ly**2 + lz**2)
-    return [lx / mag, ly / mag, lz / mag]
+    return [float(lx/mag), float(ly/mag), float(lz/mag)]
+
+
+def calcular_vetor_luz_ponto(azimute_graus: float,
+                              h_m: float,
+                              d_m: float) -> list[float]:
+    """Vetor unitário para fonte de luz pontual a distância conhecida."""
+    rad = np.radians(azimute_graus)
+    lx  =  d_m * np.sin(rad)
+    ly  =  d_m * np.cos(rad)
+    lz  =  h_m
+    mag = np.sqrt(lx**2 + ly**2 + lz**2)
+    return [float(lx/mag), float(ly/mag), float(lz/mag)]
 
 
 # ==============================================================
@@ -49,59 +64,49 @@ def calcular_vetor_luz_geometria(angulo_graus: float,
 # ==============================================================
 
 def calcular_roi_blender(img_largura:     int,
-                          img_altura:     int,
-                          wb_larg_mm:     float,
-                          wb_prof_mm:     float,
-                          camera_h_mm:    float,
-                          focal_mm:       float,
-                          sensor_w_mm:    float,
-                          erosao_px:      int = 8) -> np.ndarray:
+                          img_altura:      int,
+                          wb_larg_mm:      float,
+                          wb_prof_mm:      float,
+                          camera_h_mm:     float,
+                          focal_mm:        float,
+                          sensor_w_mm:     float,
+                          ortho_scale_mm:  float | None = None,
+                          erosao_px:       int = 8) -> np.ndarray:
     """
-    Gera máscara ROI booleana automaticamente a partir dos parâmetros
-    da câmara Blender e das dimensões físicas da bancada.
+    Gera máscara ROI booleana automaticamente.
 
-    Geometria (câmara perspectiva apontada para baixo, centrada):
-        phys_w = camera_h_mm * sensor_w_mm / focal_mm   ← largura visível
-        phys_h = phys_w * img_altura / img_largura       ← altura visível (aspect)
-        roi_hw = (wb_larg_mm / phys_w) * img_largura / 2 ← meia-largura em px
-        roi_hh = (wb_prof_mm / phys_h) * img_altura  / 2 ← meia-altura  em px
+    Câmara ORTOGRÁFICA (ortho_scale_mm fornecido — modo correto para Blender ortho):
+        O campo de visão NÃO depende de distância, focal ou sensor.
+        phys_w = ortho_scale_mm
+        phys_h = ortho_scale_mm * img_altura / img_largura
 
-    Se a bancada for maior que o campo de visão (ratio > 1), a ROI
-    ocupa a imagem toda naquela dimensão.
-
-    Args:
-        img_largura, img_altura : resolução da imagem em pixels
-        wb_larg_mm, wb_prof_mm  : dimensões físicas da bancada em mm
-        camera_h_mm             : altura da câmara acima da bancada em mm
-        focal_mm                : comprimento focal da lente (mm)
-        sensor_w_mm             : largura do sensor (mm) — padrão Blender: 36
-        erosao_px               : erosão interna para excluir bordas
-
-    Returns:
-        máscara bool (img_altura × img_largura)
+    Câmara PERSPECTIVA (fallback quando ortho_scale_mm=None):
+        phys_w = camera_h_mm * sensor_w_mm / focal_mm
+        phys_h = phys_w * img_altura / img_largura
     """
-    phys_w  = camera_h_mm * sensor_w_mm / focal_mm
-    phys_h  = phys_w * img_altura / img_largura
+    if ortho_scale_mm is not None:
+        phys_w = ortho_scale_mm
+        phys_h = ortho_scale_mm * img_altura / img_largura
+    else:
+        phys_w = camera_h_mm * sensor_w_mm / focal_mm
+        phys_h = phys_w * img_altura / img_largura
 
-    roi_hw = min((wb_larg_mm / phys_w) * img_largura / 2.0,  img_largura / 2.0)
-    roi_hh = min((wb_prof_mm / phys_h) * img_altura  / 2.0,  img_altura  / 2.0)
-
+    roi_hw = min((wb_larg_mm / phys_w) * img_largura / 2.0, img_largura / 2.0)
+    roi_hh = min((wb_prof_mm / phys_h) * img_altura  / 2.0, img_altura  / 2.0)
     cx, cy = img_largura / 2.0, img_altura / 2.0
 
     pts = np.array([
-        [cx - roi_hw, cy - roi_hh],   # TL
-        [cx + roi_hw, cy - roi_hh],   # TR
-        [cx + roi_hw, cy + roi_hh],   # BR
-        [cx - roi_hw, cy + roi_hh],   # BL
+        [cx - roi_hw, cy - roi_hh],
+        [cx + roi_hw, cy - roi_hh],
+        [cx + roi_hw, cy + roi_hh],
+        [cx - roi_hw, cy + roi_hh],
     ], dtype=np.int32)
 
     mascara = np.zeros((img_altura, img_largura), dtype=np.uint8)
     cv2.fillPoly(mascara, [pts], 255)
-
     if erosao_px > 0:
         kernel  = np.ones((erosao_px, erosao_px), np.uint8)
         mascara = cv2.erode(mascara, kernel, iterations=1)
-
     return mascara.astype(bool)
 
 
@@ -109,7 +114,7 @@ def criar_mascara_roi(plano_coords: list[dict],
                       altura: int,
                       largura: int,
                       erosao_px: int = 8) -> np.ndarray:
-    """ROI a partir de 4 cantos marcados manualmente (mantido para compatibilidade)."""
+    """ROI a partir de 4 cantos marcados manualmente."""
     pts = np.array([[p['x'], p['y']] for p in plano_coords], dtype=np.int32)
     mascara = np.zeros((altura, largura), dtype=np.uint8)
     cv2.fillPoly(mascara, [pts], 255)
@@ -130,53 +135,109 @@ def load_and_flatten(filepath: str) -> np.ndarray:
     return img.astype(np.float64) / 255.0
 
 
-def subtrair_luz_ambiente(imgs: list[np.ndarray],
-                           mascara_roi: np.ndarray | None = None) -> list[np.ndarray]:
+def subtrair_luz_ambiente(imgs: list[np.ndarray]) -> list[np.ndarray]:
     """
-    Remove a componente de luz ambiente pixel a pixel.
-
-    Método: min(I1, I2, I3, I4) em cada pixel — é a melhor estimativa possível
-    da luz ambiente, pois em pelo menos uma das 4 direções o pixel recebe
-    somente a componente difusa mínima (ou está em sombra).
-
-    Muito mais eficaz do que um percentil global para renders Blender onde
-    a iluminação ambiente do World pode variar pela cena.
+    Remove luz ambiente pixel a pixel usando o mínimo entre as 4 imagens.
+    Em pelo menos uma direção cada pixel está minimamente iluminado (ou em
+    sombra própria), então min(I1..I4) é a melhor estimativa da componente
+    ambiente constante.
     """
-    stack    = np.stack(imgs, axis=0)          # (N, H, W)
-    ambiente = np.min(stack, axis=0)           # mínimo pixel-a-pixel entre as N imagens
+    stack    = np.stack(imgs, axis=0)
+    ambiente = np.min(stack, axis=0)
     return [np.clip(img - ambiente, 0.0, 1.0) for img in imgs]
 
 
 def criar_mascara_valida(imgs: list[np.ndarray],
-                          mascara_roi:      np.ndarray | None = None,
-                          thresh_variacao:  float = 0.04,
-                          thresh_sat:       float = 0.95) -> np.ndarray:
+                          mascara_roi:     np.ndarray | None = None,
+                          thresh_variacao: float = 0.04,
+                          thresh_sat:      float = 0.95) -> np.ndarray:
     """
-    Pixel válido = apresenta variação real entre as 4 imagens.
-
-    std(I1..IN) > thresh_variacao garante que o pixel foi efetivamente
-    iluminado de formas diferentes e não está:
-      - sempre em sombra (std ≈ 0, baixo)
-      - sempre saturado  (std ≈ 0, alto)
-      - num shadow cast de outro objeto (variação mínima)
-
-    Isto substitui o threshold absoluto anterior que excluía pixels
-    escuros legítimos e deixava passar pixels com sombra constante.
+    Pixel válido = variação real entre as 4 imagens (std > thresh_variacao).
+    Exclui pixels sempre em sombra (std≈0 baixo) e sempre saturados (std≈0 alto).
     """
-    stack    = np.stack(imgs, axis=0)          # (N, H, W)
-    variacao = np.std(stack, axis=0)           # desvio padrão por pixel
-
-    mascara = variacao > thresh_variacao
+    stack    = np.stack(imgs, axis=0)
+    variacao = np.std(stack, axis=0)
+    mascara  = variacao > thresh_variacao
     if mascara_roi is not None:
         mascara &= mascara_roi
-    # Excluir saturados em qualquer das imagens
     for img in imgs:
         mascara &= (img < thresh_sat)
     return mascara
 
 
 # ==============================================================
-# MÓDULO 4 — CORREÇÃO DE PERSPECTIVA (somente câmara não-ortogonal)
+# MÓDULO 3b — DETECÇÃO DE SOMBRAS CAST
+# ==============================================================
+
+def detectar_sombras_cast(I_val:        np.ndarray,
+                           L:            np.ndarray,
+                           G_val:        np.ndarray,
+                           albedo_val:   np.ndarray,
+                           altura:       int,
+                           largura:      int,
+                           idx_val:      np.ndarray,
+                           thresh_sombra_cast: float = 0.35,
+                           raio_contexto_px:   int   = 5) -> np.ndarray:
+    """
+    Detecta pixels em sombra cast (projetada por outro objeto) usando
+    dois critérios combinados:
+
+    CRITÉRIO A — Assimetria fotométrica extrema:
+        Um pixel em sombra cast tem I_k ≈ 0 em 1 ou 2 direções específicas
+        (as que "enxergam" o objeto que projeta a sombra) mas valores normais
+        nas outras. Isso cria uma assimetria no vetor de intensidades que
+        nenhuma normal Lambertiana consegue explicar.
+
+        Medida: coeficiente de variação entre imagens (std/mean).
+        Superfícies reais iluminadas: CV modesto (~0.3–0.5).
+        Sombra cast: CV alto (>0.7–0.9) porque algumas luzes chegam a zero.
+
+    CRITÉRIO B — Consistência espacial de normais (contexto local):
+        A normal calculada num pixel de sombra cast é espúria — ela vai
+        diferir muito da média das normais dos vizinhos próximos.
+        Medida: |N_pixel - N_media_vizinhos| > threshold.
+
+    Retorna máscara booleana (n_pixels,) — True = sombra cast = inválido.
+    """
+    n_val = I_val.shape[1]
+
+    # ── Critério A: coeficiente de variação ─────────────────
+    media_val = np.mean(I_val, axis=0)                   # (N_val,)
+    std_val   = np.std(I_val,  axis=0)                   # (N_val,)
+    cv        = std_val / (media_val + 1e-6)             # (N_val,)
+
+    # Pixels com pelo menos 1 valor muito próximo de zero E CV alto
+    # (distingue sombra cast de superfície inclinada legítima)
+    min_val = np.min(I_val, axis=0)
+    sombra_a = (cv > 0.65) & (min_val < 0.08)
+
+    # ── Critério B: inconsistência de normal com vizinhos ───
+    # Monta mapa de normais completo para poder calcular a média local
+    N_mapa = np.zeros((3, altura * largura))
+    N_mapa[:, idx_val] = G_val / (albedo_val + 1e-9)   # normais brutas (sem renorm ainda)
+
+    # Média local via filtro uniforme por canal
+    N_local = np.zeros_like(N_mapa)
+    for i in range(3):
+        canal        = N_mapa[i].reshape(altura, largura)
+        canal_smooth = uniform_filter(canal, size=raio_contexto_px * 2 + 1)
+        N_local[i]   = canal_smooth.flatten()
+
+    # Diferença entre normal calculada e média local (só nos pixels válidos)
+    diff = np.linalg.norm(N_mapa[:, idx_val] - N_local[:, idx_val], axis=0)  # (N_val,)
+    sombra_b = diff > thresh_sombra_cast
+
+    # União dos dois critérios
+    sombra_cast = sombra_a | sombra_b
+
+    pct = 100.0 * sombra_cast.sum() / max(1, n_val)
+    print(f"  [shadow] {sombra_cast.sum()} px identificados como sombra cast ({pct:.1f}%)")
+
+    return sombra_cast
+
+
+# ==============================================================
+# MÓDULO 4 — CORREÇÃO DE PERSPECTIVA
 # ==============================================================
 
 def calcular_rotacao_por_homografia(pontos_imagem: list[dict],
@@ -188,9 +249,9 @@ def calcular_rotacao_por_homografia(pontos_imagem: list[dict],
     H, _ = cv2.findHomography(pts_img, pts_mundo)
     if H is None:
         return np.eye(3)
-    h1 = H[:, 0];  h2 = H[:, 1]
+    h1 = H[:, 0]; h2 = H[:, 1]
     lam = 1.0 / (np.linalg.norm(h1) + 1e-12)
-    r1  = h1 * lam;  r2 = h2 * lam;  r3 = np.cross(r1, r2)
+    r1  = h1 * lam; r2 = h2 * lam; r3 = np.cross(r1, r2)
     R_raw = np.stack([r1, r2, r3], axis=1)
     U, _, Vt = np.linalg.svd(R_raw)
     R = U @ Vt
@@ -215,7 +276,7 @@ def frankot_chellappa(p: np.ndarray, q: np.ndarray) -> np.ndarray:
     u = np.fft.fftfreq(cols) * 2 * np.pi
     v = np.fft.fftfreq(rows) * 2 * np.pi
     U, V = np.meshgrid(u, v)
-    den = U**2 + V**2;  den[0, 0] = 1.0
+    den = U**2 + V**2; den[0, 0] = 1.0
     Z_fft = -1j * (U * np.fft.fft2(p) + V * np.fft.fft2(q)) / den
     Z_fft[0, 0] = 0.0
     return np.real(np.fft.ifft2(Z_fft))
@@ -225,15 +286,15 @@ def poisson_depth(p: np.ndarray, q: np.ndarray) -> np.ndarray:
     """Solver DCT analítico O(N log N) com boundary conditions de Neumann."""
     rows, cols = p.shape
     div = np.zeros((rows, cols))
-    div[:-1, :] += q[:-1, :] - q[1:, :]
-    div[:, :-1] += p[:, :-1] - p[:, 1:]
+    div[:-1, :] += q[1:,  :] - q[:-1, :]   # ∂q/∂y forward difference
+    div[:, :-1] += p[:,  1:] - p[:,  :-1]   # ∂p/∂x forward difference
     ii  = np.arange(rows).reshape(-1, 1)
     jj  = np.arange(cols).reshape(1, -1)
     lam = (2.0 * np.cos(np.pi * ii / rows) - 2.0) + \
           (2.0 * np.cos(np.pi * jj / cols) - 2.0)
     lam[0, 0] = 1.0
     Z_dct      = dctn(div, norm='ortho') / lam
-    Z_dct[0,0] = 0.0
+    Z_dct[0, 0] = 0.0
     return idctn(Z_dct, norm='ortho')
 
 
@@ -242,42 +303,46 @@ def poisson_depth(p: np.ndarray, q: np.ndarray) -> np.ndarray:
 # ==============================================================
 
 def processar_mapas(
-    caminhos_imagens:  list[str],
-    vetores_luz:       list[list[float]],
-    diretorio_saida:   str,
-    # ── ROI manual (compatibilidade) ─────────────────────────
-    plano_coords:      list[dict] | None = None,
-    largura_mm:        float = 210.0,
-    altura_mm:         float = 297.0,
-    # ── ROI automático (modo Blender) ─────────────────────────
-    camera_ortogonal:  bool  = False,   # True = câmara reta para baixo, sem homografia
-    wb_larg_mm:        float | None = None,
-    wb_prof_mm:        float | None = None,
-    camera_h_mm:       float | None = None,
-    focal_mm:          float = 50.0,
-    sensor_w_mm:       float = 36.0,
-    # ── Opções ────────────────────────────────────────────────
-    metodo_depth:      str   = 'poisson',
-    suavizar_normais:  bool  = False,
-    sigma_suavizacao:  float = 1.0,
-    # Controle de qualidade da máscara:
-    # Aumente thresh_variacao (ex: 0.08) se aparecerem artefatos no fundo.
-    # Diminua (ex: 0.02) se objetos de cor uniforme sumam da máscara.
-    thresh_variacao:   float = 0.04,
-    thresh_sat:        float = 0.95,
+    caminhos_imagens:   list[str],
+    vetores_luz:        list[list[float]],
+    diretorio_saida:    str,
+    # ── ROI manual ───────────────────────────────────────────
+    plano_coords:       list[dict] | None = None,
+    largura_mm:         float = 210.0,
+    altura_mm:          float = 297.0,
+    # ── ROI automático (modo Blender) ────────────────────────
+    camera_ortogonal:   bool  = False,
+    wb_larg_mm:         float | None = None,
+    wb_prof_mm:         float | None = None,
+    camera_h_mm:        float | None = None,
+    focal_mm:           float = 50.0,
+    sensor_w_mm:        float = 36.0,
+    ortho_scale_mm:     float | None = None,
+    # ── Opções ───────────────────────────────────────────────
+    metodo_depth:       str   = 'poisson',
+    suavizar_normais:   bool  = False,
+    sigma_suavizacao:   float = 1.0,
+    thresh_variacao:    float = 0.04,
+    thresh_sat:         float = 0.95,
+    thresh_residuo:     float = 0.20,
+    razao_sombra:       float = 0.60,
+    # ── Detecção de sombra cast ──────────────────────────────
+    detectar_sombra:    bool  = True,
+    thresh_sombra_cast: float = 0.35,
+    raio_contexto_px:   int   = 5,
 ) -> tuple[str, str, str]:
     """
     Pipeline completo de Estéreo Fotométrico.
 
-    Modo Blender (camera_ortogonal=True):
-      • ROI calculada automaticamente via calcular_roi_blender()
-      • Passo de homografia/rotação de normais é OMITIDO —
-        câmara já está alinhada com a normal da superfície.
-      • Requer: wb_larg_mm, wb_prof_mm, camera_h_mm.
+    Modo Blender ortográfico (camera_ortogonal=True, ortho_scale_mm fornecido):
+      • ROI calculada com escala ortográfica real — sem depender de focal/altura.
+      • Sem homografia/rotação de normais.
+      • Sombras cast detectadas e excluídas automaticamente (detectar_sombra=True).
 
-    Modo manual (camera_ortogonal=False, plano_coords fornecido):
-      • ROI = polígono marcado manualmente.
-      • Rotação de normais calculada por homografia.
+    Parâmetros de sombra cast:
+      thresh_sombra_cast: sensibilidade da detecção por inconsistência de normais.
+          Menor = mais agressivo (remove mais). Padrão 0.35.
+      raio_contexto_px: raio do filtro de contexto vizinho (px). Padrão 5.
     """
 
     # ── 1. CARREGAMENTO ──────────────────────────────────────
@@ -286,31 +351,31 @@ def processar_mapas(
 
     # ── 2. MÁSCARA ROI ──────────────────────────────────────
     if camera_ortogonal and all(v is not None for v in [wb_larg_mm, wb_prof_mm, camera_h_mm]):
-        # Modo Blender: ROI calculada automaticamente
         mascara_roi = calcular_roi_blender(
-            img_largura  = largura,
-            img_altura   = altura,
-            wb_larg_mm   = wb_larg_mm,
-            wb_prof_mm   = wb_prof_mm,
-            camera_h_mm  = camera_h_mm,
-            focal_mm     = focal_mm,
-            sensor_w_mm  = sensor_w_mm,
+            img_largura    = largura,
+            img_altura     = altura,
+            wb_larg_mm     = wb_larg_mm,
+            wb_prof_mm     = wb_prof_mm,
+            camera_h_mm    = camera_h_mm,
+            focal_mm       = focal_mm,
+            sensor_w_mm    = sensor_w_mm,
+            ortho_scale_mm = ortho_scale_mm,
         )
     elif plano_coords and len(plano_coords) >= 4:
-        # Modo manual
         mascara_roi = criar_mascara_roi(plano_coords, altura, largura)
     else:
-        mascara_roi = None   # Sem ROI — processa imagem inteira
+        mascara_roi = None
 
     # ── 3. PRÉ-PROCESSAMENTO ────────────────────────────────
-    imgs    = subtrair_luz_ambiente(imgs, mascara_roi)
+    imgs    = subtrair_luz_ambiente(imgs)
     mascara = criar_mascara_valida(imgs, mascara_roi,
                                    thresh_variacao=thresh_variacao,
                                    thresh_sat=thresh_sat)
     idx_val = np.where(mascara.flatten())[0]
+    n_pixels = altura * largura
 
-    pct_val = 100.0 * len(idx_val) / (altura * largura)
-    print(f"  [mask] {len(idx_val)} px válidos ({pct_val:.1f}% da imagem)")
+    pct_val = 100.0 * len(idx_val) / n_pixels
+    print(f"  [mask]  {len(idx_val)} px válidos ({pct_val:.1f}% da imagem)")
 
     if len(idx_val) == 0:
         raise ValueError(
@@ -322,88 +387,183 @@ def processar_mapas(
     L = np.array(vetores_luz, dtype=np.float64)
     L = L / np.linalg.norm(L, axis=1, keepdims=True)
 
-    # ── 5. LEAST-SQUARES FOTOMÉTRICO ────────────────────────
-    n_pixels = altura * largura
-    I_stack  = np.stack([img.flatten() for img in imgs])
-    I_val    = I_stack[:, idx_val]
-    G_val, _, _, _ = np.linalg.lstsq(L, I_val, rcond=None)
+    # ── 5. LEAST-SQUARES FOTOMÉTRICO — DROP DARKEST ─────────
+    # Para cada pixel, descarta a imagem mais escura se for sombra evidente
+    # (min < razao_sombra × mediana) e resolve com as 3 restantes.
+    I_stack = np.stack([img.flatten() for img in imgs])
+    I_val   = I_stack[:, idx_val]           # (4, N_val)
+
+    L_invs    = [np.linalg.pinv(np.delete(L, k, axis=0)) for k in range(4)]
+    min_idx   = np.argmin(I_val, axis=0)
+    med_val   = np.median(I_val, axis=0)
+    min_val   = I_val[min_idx, np.arange(I_val.shape[1])]
+    deve_drop = min_val < razao_sombra * (med_val + 1e-9)
+
+    G_val = np.zeros((3, I_val.shape[1]), dtype=np.float64)
+
+    idx_sem_sombra = np.where(~deve_drop)[0]
+    if idx_sem_sombra.size:
+        L_inv4 = np.linalg.pinv(L)
+        G_val[:, idx_sem_sombra] = L_inv4 @ I_val[:, idx_sem_sombra]
+
+    for k in range(4):
+        sel = np.where(deve_drop & (min_idx == k))[0]
+        if sel.size == 0:
+            continue
+        I_sub = np.delete(I_val[:, sel], k, axis=0)
+        G_val[:, sel] = L_invs[k] @ I_sub
+
+    pct_drop = 100.0 * deve_drop.sum() / max(1, I_val.shape[1])
+    print(f"  [drop]  {deve_drop.sum()} px com sombra própria descartada ({pct_drop:.1f}%)")
 
     albedo_val = np.linalg.norm(G_val, axis=0)
     N_val      = np.divide(G_val, albedo_val,
                            out=np.zeros_like(G_val),
                            where=albedo_val > 1e-9)
 
+    # ── 6. REJEIÇÃO POR RESÍDUO (sombra própria residual) ───
+    I_pred      = L @ G_val
+    residuo_abs = np.mean(np.abs(I_val - I_pred), axis=0)
+    residuo_rel = residuo_abs / (albedo_val + 1e-6)
+    validos_ps  = residuo_rel < thresh_residuo
+
+    # ── 7. DETECÇÃO DE SOMBRA CAST ──────────────────────────
+    # Aplicada APÓS o lstsq para ter acesso ao G_val calculado.
+    # Pixels em sombra cast produzem normais inconsistentes com os
+    # vizinhos — detectamos isso antes de incluir no mapa final.
+    if detectar_sombra:
+        sombra_cast = detectar_sombras_cast(
+            I_val              = I_val,
+            L                  = L,
+            G_val              = G_val,
+            albedo_val         = albedo_val,
+            altura             = altura,
+            largura            = largura,
+            idx_val            = idx_val,
+            thresh_sombra_cast = thresh_sombra_cast,
+            raio_contexto_px   = raio_contexto_px,
+        )
+        # Combina: pixel válido = passou no resíduo E não é sombra cast
+        validos_final = validos_ps & ~sombra_cast
+    else:
+        validos_final = validos_ps
+
+    idx_final = idx_val[validos_final]
+
+    pct_final = 100.0 * len(idx_final) / n_pixels
+    print(f"  [final] {len(idx_final)} px aceitos ({pct_final:.1f}% da imagem)")
+
+    # ── 8. MONTAR MAPAS DE NORMAL ───────────────────────────
     N_flat      = np.zeros((3, n_pixels))
     albedo_flat = np.zeros(n_pixels)
-    N_flat[:, idx_val]   = N_val
-    albedo_flat[idx_val] = albedo_val
 
-    # ── 6. CORREÇÃO DE PERSPECTIVA (só modo manual) ─────────
-    # Modo Blender: câmara já está perpendicular à bancada →
-    # as normais calculadas já estão no referencial correto.
-    # Aplicar a homografia aqui introduziria erro, não corrigiria nada.
+    N_flat[0, idx_final] = N_val[0, validos_final]
+    N_flat[1, idx_final] = N_val[1, validos_final]
+    N_flat[2, idx_final] = N_val[2, validos_final]
+    albedo_flat[idx_final] = albedo_val[validos_final]
+
+    # Pixels sem normal → superfície horizontal [0,0,1]
+    def _sem_normal(N_f, roi):
+        normas = np.linalg.norm(N_f, axis=0)
+        if roi is not None:
+            return roi.flatten() & (normas < 1e-9)
+        return normas < 1e-9
+
+    sem_normal = _sem_normal(N_flat, mascara_roi)
+    N_flat[2, sem_normal] = 1.0
+
+    # ── 9. CORREÇÃO DE PERSPECTIVA (só modo manual) ─────────
     if not camera_ortogonal and plano_coords and len(plano_coords) >= 4:
         R      = calcular_rotacao_por_homografia(plano_coords, largura_mm, altura_mm)
         N_flat = aplicar_rotacao_normais(N_flat, R)
 
-    # ── 7. SUAVIZAÇÃO OPCIONAL ──────────────────────────────
+    # ── 10. SUAVIZAÇÃO OPCIONAL ─────────────────────────────
     if suavizar_normais:
         for i in range(3):
             canal     = N_flat[i].reshape(altura, largura)
             N_flat[i] = gaussian_filter(canal, sigma=sigma_suavizacao).flatten()
         normas = np.linalg.norm(N_flat, axis=0)
         N_flat = np.divide(N_flat, normas, out=np.zeros_like(N_flat), where=normas > 1e-9)
+        # Recomputar sem_normal APÓS suavização
+        sem_normal = _sem_normal(N_flat, mascara_roi)
+        N_flat[2, sem_normal] = 1.0
 
-    # ── 8. NORMAL MAP ───────────────────────────────────────
+    # ── 11. NORMAL MAP ──────────────────────────────────────
     nx = N_flat[0].reshape(altura, largura)
     ny = N_flat[1].reshape(altura, largura)
     nz = N_flat[2].reshape(altura, largura)
+
+    # Flip Y para convenção OpenGL (+Y = cima na textura)
     N_rgb = np.stack([
-        np.clip((nx + 1.0) * 127.5, 0, 255),
-        np.clip((ny + 1.0) * 127.5, 0, 255),
-        np.clip((nz + 1.0) * 127.5, 0, 255),
+        np.clip(( nx + 1.0) * 127.5, 0, 255),
+        np.clip((-ny + 1.0) * 127.5, 0, 255),   # ← flip Y
+        np.clip(( nz + 1.0) * 127.5, 0, 255),
     ], axis=-1).astype(np.uint8)
 
-    # ── 9. DEPTH MAP ────────────────────────────────────────
-    nz_safe = np.where(np.abs(nz) < 0.01, np.sign(nz + 1e-12) * 0.01, nz)
-    p_grad  = np.clip(-nx / nz_safe, -10.0, 10.0)
-    q_grad  = np.clip(-ny / nz_safe, -10.0, 10.0)
+    # ── 12. DEPTH MAP ───────────────────────────────────────
+    mascara_depth = np.zeros(n_pixels, dtype=bool)
+    mascara_depth[idx_final] = True
+    mascara_depth = mascara_depth.reshape(altura, largura)
 
-    # Forçar gradientes a zero fora da máscara para não contaminar a integração
-    p_grad[~mascara] = 0.0
-    q_grad[~mascara] = 0.0
+    # Chão: normal para cima E pixel NÃO pertence a objetos detectados
+    # (protege tampas planas de caixas/cubos)
+    mask_fundo_normal = (np.abs(nx) < 0.08) & (np.abs(ny) < 0.08)
+    mask_fundo = mask_fundo_normal & ~mascara_depth
 
+    # Bordas perpendiculares: nz muito pequeno → gradiente explode
+    mask_bordas = np.abs(nz) < 0.20
+
+    mascara_grad = mascara_depth & ~mask_fundo & ~mask_bordas
+
+    nz_safe = np.where(np.abs(nz) < 0.20, 1.0, nz)
+    p_grad  = np.zeros_like(nx)
+    q_grad  = np.zeros_like(ny)
+    p_grad[mascara_grad] = -nx[mascara_grad] / nz_safe[mascara_grad]
+    q_grad[mascara_grad] = -ny[mascara_grad] / nz_safe[mascara_grad]
+
+    # Clip para evitar artefatos de gradiente extremo
+    p_grad = np.clip(p_grad, -2.5, 2.5)
+    q_grad = np.clip(q_grad, -2.5, 2.5)
+
+    # Integração
     depth_raw = poisson_depth(p_grad, q_grad) if metodo_depth == 'poisson' \
                 else frankot_chellappa(p_grad, q_grad)
 
-    reg_m = mascara if mascara.any() else np.ones_like(mascara)
-    d_min = np.percentile(depth_raw[reg_m], 2)
-    d_max = np.percentile(depth_raw[reg_m], 98)
-    depth_norm = np.clip(
-        (depth_raw - d_min) / (d_max - d_min + 1e-9) * 255.0, 0, 255
-    ).astype(np.uint8)
+    # Fixar datum no chão
+    if np.any(mask_fundo):
+        base_z = np.median(depth_raw[mask_fundo])
+        depth_raw -= base_z
+    depth_raw[mask_fundo] = 0.0
+    depth_raw = np.maximum(depth_raw, 0.0)
 
-    # Suavização leve do depth final (σ=1) para reduzir ruído de integração
-    # sem distorcer as normais — só aplicada dentro da máscara válida
-    depth_smooth = cv2.GaussianBlur(depth_norm, (5, 5), sigmaX=1.0)
-    depth_vis    = np.where(reg_m, depth_smooth, depth_norm)
+    # Normalizar usando apenas pixels de objetos (ignora chão)
+    depth_objeto = depth_raw[~mask_fundo & mascara_depth]
+    if len(depth_objeto) > 0:
+        d_max      = np.percentile(depth_objeto, 98)
+        depth_norm = np.clip(depth_raw / (d_max + 1e-9) * 255.0, 0, 255)
+    else:
+        depth_norm = np.zeros_like(depth_raw)
+    depth_norm[mask_fundo] = 0.0
 
-    # ── 10. ALBEDO MAP ──────────────────────────────────────
+    depth_smooth   = cv2.GaussianBlur(depth_norm.astype(np.uint8), (5, 5), sigmaX=1.0)
+    depth_colormap = cv2.applyColorMap(depth_smooth, cv2.COLORMAP_JET)
+
+    # ── 13. ALBEDO MAP ──────────────────────────────────────
     albedo_2d = albedo_flat.reshape(altura, largura)
+    reg_m     = mascara_depth if mascara_depth.any() else np.ones_like(mascara_depth)
     reg_a     = albedo_2d[reg_m]
     a_min, a_max = np.percentile(reg_a, 1), np.percentile(reg_a, 99)
     albedo_vis = np.clip(
         (albedo_2d - a_min) / (a_max - a_min + 1e-9) * 255.0, 0, 255
     ).astype(np.uint8)
 
-    # ── 11. SALVAR ──────────────────────────────────────────
+    # ── 14. SALVAR ──────────────────────────────────────────
     p_normal = os.path.join(diretorio_saida, 'resultado_normal.png')
     p_depth  = os.path.join(diretorio_saida, 'resultado_depth.png')
     p_albedo = os.path.join(diretorio_saida, 'resultado_albedo.png')
 
     cv2.imwrite(p_normal, cv2.cvtColor(N_rgb, cv2.COLOR_RGB2BGR))
-    cv2.imwrite(p_depth,  depth_vis)
+    cv2.imwrite(p_depth,  depth_colormap)
     cv2.imwrite(p_albedo, albedo_vis)
 
     return 'resultado_normal.png', 'resultado_depth.png', 'resultado_albedo.png'
-

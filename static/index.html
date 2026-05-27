@@ -250,15 +250,40 @@ header span{font-family:var(--mono);font-size:.7rem;color:var(--dim);letter-spac
     <div id="roiBadge"></div>
 
     <!-- PARÂMETROS DA LUZ ───────────────────────────────── -->
-    <p class="sec">geometria da luz — em metros</p>
-    <div class="params-grid">
+    <p class="sec">geometria da luz</p>
+    <div class="params-grid" style="margin-bottom:10px">
+        <div class="fld" style="grid-column:1/-1">
+            <label>TIPO DE FONTE</label>
+            <div style="display:flex;gap:8px;margin-top:4px" id="tipoLuzBtns">
+                <button class="btn btn-primary" id="btnSol"   onclick="setTipoLuz('sol')"   style="padding:5px 16px;font-size:.72rem">☀ Sol / Direcional</button>
+                <button class="btn btn-ghost"   id="btnPonto" onclick="setTipoLuz('ponto')" style="padding:5px 16px;font-size:.72rem">● Ponto / Área</button>
+            </div>
+        </div>
+    </div>
+    <!-- Painel Sol -->
+    <div id="painelSol" class="params-grid">
+        <div class="fld">
+            <label>ELEVAÇÃO (°)
+                <span style="color:var(--warn);font-size:.55rem">Blender: Rotation X = 45°</span>
+            </label>
+            <input type="number" id="cfgElevacao" value="45" min="5" max="89" step="1">
+        </div>
+        <div class="fld" style="display:flex;align-items:flex-end;padding-bottom:2px">
+            <span style="font-family:var(--mono);font-size:.68rem;color:var(--dim);line-height:1.6">
+                Vetores calculados como<br>
+                <code style="color:var(--grn)">L=[sin(az)·cos(el), cos(az)·cos(el), sin(el)]</code>
+            </span>
+        </div>
+    </div>
+    <!-- Painel Ponto (oculto por padrão) -->
+    <div id="painelPonto" class="params-grid" style="display:none">
         <div class="fld">
             <label>ALTURA LUZ h (m)</label>
-            <input type="number" id="cfgH" value="0.025" min="0.001" max="5"   step="0.001">
+            <input type="number" id="cfgH" value="0.025" min="0.001" max="5" step="0.001">
         </div>
         <div class="fld">
             <label>DISTÂNCIA HORIZONTAL d (m)</label>
-            <input type="number" id="cfgD" value="0.1"   min="0.001" max="10"  step="0.001">
+            <input type="number" id="cfgD" value="0.1" min="0.001" max="10" step="0.001">
         </div>
     </div>
 
@@ -273,8 +298,22 @@ header span{font-family:var(--mono);font-size:.7rem;color:var(--dim);letter-spac
             </select>
         </div>
         <div class="fld">
+            <label>DROP-DARKEST (razão)
+                <span style="color:var(--dim);font-size:.55rem">↓ = só sombras fortes</span>
+            </label>
+            <input type="number" id="cfgRazao" value="0.60" min="0.1" max="1.0" step="0.05"
+                   title="Descarta a luz mais escura se min < X*mediana. 0.6=moderado, 0.4=agressivo, 0.8=suave">
+        </div>
+        <div class="fld">
+            <label>REJEIÇÃO DE SOMBRA
+                <span style="color:var(--dim);font-size:.55rem">↓ = mais rigoroso</span>
+            </label>
+            <input type="number" id="cfgResiduo" value="0.20" min="0.05" max="1.0" step="0.05"
+                   title="Resíduo relativo máximo. Diminua (0.10) para rejeitar mais sombras; aumente (0.40) se objetos sumam.">
+        </div>
+        <div class="fld">
             <label>SENSIBILIDADE DA MÁSCARA
-                <span style="color:var(--dim);font-size:.55rem">↑ = menos ruído, ↓ = mais área</span>
+                <span style="color:var(--dim);font-size:.55rem">↑ = menos ruído</span>
             </label>
             <input type="number" id="cfgThresh" value="0.04" min="0.005" max="0.3" step="0.005"
                    title="Threshold de variação entre imagens. Aumente se houver artefatos no fundo.">
@@ -530,14 +569,43 @@ function atualizarROI() {
         `→ bancada ocupa ≈ <strong>${rX}%</strong> × <strong>${rY}%</strong> da imagem`;
 }
 
+
+// ════════════════════════════════════════════════════════════
+// TIPO DE LUZ
+// ════════════════════════════════════════════════════════════
+let tipoLuz = 'sol';
+
+function setTipoLuz(tipo) {
+    tipoLuz = tipo;
+    document.getElementById('painelSol').style.display   = tipo === 'sol'   ? '' : 'none';
+    document.getElementById('painelPonto').style.display = tipo === 'ponto' ? '' : 'none';
+    document.getElementById('btnSol').className   = 'btn ' + (tipo === 'sol'   ? 'btn-primary' : 'btn-ghost');
+    document.getElementById('btnPonto').className = 'btn ' + (tipo === 'ponto' ? 'btn-primary' : 'btn-ghost');
+    buildCards();
+}
+
 // ════════════════════════════════════════════════════════════
 // VETORES DE LUZ
 // ════════════════════════════════════════════════════════════
-function calcVetor(angGraus, h, d) {
-    const rad = angGraus * Math.PI / 180;
-    const lx = d * Math.sin(rad), ly = d * Math.cos(rad), lz = h;
-    const mag = Math.sqrt(lx*lx + ly*ly + lz*lz);
-    return [lx/mag, ly/mag, lz/mag];
+function calcVetor(angGraus) {
+    if (tipoLuz === 'sol') {
+        // Sol direcional: vetor esférico por azimute + elevação
+        const el  = (parseFloat(document.getElementById('cfgElevacao').value) || 45) * Math.PI / 180;
+        const az  = angGraus * Math.PI / 180;
+        const lx  = Math.sin(az) * Math.cos(el);
+        const ly  = Math.cos(az) * Math.cos(el);
+        const lz  = Math.sin(el);
+        const mag = Math.sqrt(lx*lx + ly*ly + lz*lz);
+        return [lx/mag, ly/mag, lz/mag];
+    } else {
+        // Ponto: vetor por posição física h/d
+        const h   = (parseFloat(document.getElementById('cfgH').value) || 0.025) * 1000;
+        const d   = (parseFloat(document.getElementById('cfgD').value) || 0.1)   * 1000;
+        const rad = angGraus * Math.PI / 180;
+        const lx  = d * Math.sin(rad), ly = d * Math.cos(rad), lz = h;
+        const mag = Math.sqrt(lx*lx + ly*ly + lz*lz);
+        return [lx/mag, ly/mag, lz/mag];
+    }
 }
 
 // ════════════════════════════════════════════════════════════
@@ -562,23 +630,19 @@ async function processar() {
     loading('Calculando normal map, depth e albedo...');
     setStep(1);
 
-    const h_m = parseFloat(document.getElementById('cfgH').value) || 0.025;
-    const d_m = parseFloat(document.getElementById('cfgD').value) || 0.1;
-    // Vetores calculados com mm (mesma unidade relativa — só os ângulos importam)
-    const h = h_m * 1000, d = d_m * 1000;
-
     const payload = {
-        arquivos:        upData.arquivos,
-        vetores_luz:     slots.map(s => calcVetor(s.ang, h, d)),
-        focal_mm:        parseFloat(document.getElementById('cfgFocal').value)  || 50,
-        sensor_w_mm:     parseFloat(document.getElementById('cfgSensor').value) || 36,
-        // Converter metros → mm para o backend
-        camera_h_mm:     (parseFloat(document.getElementById('cfgCamH').value)   || 1.07) * 1000,
-        wb_larg_mm:      (parseFloat(document.getElementById('cfgWbLarg').value) || 1.0)  * 1000,
-        wb_prof_mm:      (parseFloat(document.getElementById('cfgWbProf').value) || 0.6)  * 1000,
-        metodo_depth:    document.getElementById('cfgMetodo').value,
+        arquivos:         upData.arquivos,
+        vetores_luz:      slots.map(s => calcVetor(s.ang)),
+        focal_mm:         parseFloat(document.getElementById('cfgFocal').value)  || 50,
+        sensor_w_mm:      parseFloat(document.getElementById('cfgSensor').value) || 36,
+        camera_h_mm:      (parseFloat(document.getElementById('cfgCamH').value)   || 1.07) * 1000,
+        wb_larg_mm:       (parseFloat(document.getElementById('cfgWbLarg').value) || 1.0)  * 1000,
+        wb_prof_mm:       (parseFloat(document.getElementById('cfgWbProf').value) || 0.6)  * 1000,
+        metodo_depth:     document.getElementById('cfgMetodo').value,
         suavizar_normais: document.getElementById('cfgSuavizar').checked,
-        thresh_variacao: parseFloat(document.getElementById('cfgThresh').value)  || 0.04,
+        thresh_variacao:  parseFloat(document.getElementById('cfgThresh').value)  || 0.04,
+        thresh_residuo:   parseFloat(document.getElementById('cfgResiduo').value) || 0.20,
+        razao_sombra:     parseFloat(document.getElementById('cfgRazao').value)   || 0.60,
     };
 
     let data;
