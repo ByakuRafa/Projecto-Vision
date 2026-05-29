@@ -24,8 +24,8 @@ def calcular_vetor_sol(azimute_graus: float, elevacao_graus: float = 45.0) -> li
 def main():
     # 1. Configuração de Diretórios
     # Usa os.path.join para evitar problemas com barras (\ ou /)
-    pasta_entrada = os.path.join("test_depth", "t3")
-    pasta_saida = os.path.join("test_depth", "t3_resultados")
+    pasta_entrada = os.path.join("test_depth", "t9")
+    pasta_saida = os.path.join("test_depth", "t9_resultados")
     
     # Cria a pasta de saída se ela não existir
     os.makedirs(pasta_saida, exist_ok=True)

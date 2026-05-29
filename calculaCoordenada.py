@@ -336,7 +336,7 @@ if __name__ == "__main__":
     CONFIG["workbench"]["volume_z_m"]  = args.vol_z
     CONFIG["workbench"]["offset_x_m"]  = args.cam_x
     CONFIG["workbench"]["offset_y_m"]  = args.cam_y
-    CONFIG["workbench"]["offset_z_m"]  = 10
+    CONFIG["workbench"]["offset_z_m"]  = args.cam_z
     CONFIG["floor_percentile"]         = args.floor_pct
     CONFIG["object_threshold_m"]       = args.threshold
     CONFIG["min_area_px"]              = args.min_area
@@ -345,7 +345,7 @@ if __name__ == "__main__":
     # Caminhos padrão
     base  = os.path.dirname(os.path.abspath(__file__))
     pasta = os.path.join(base, "test_depth")
-    rgb_path   = args.rgb   or os.path.join(pasta, "blenderTest2.png")
-    depth_path = args.depth or os.path.join(pasta, "img2.png")
+    rgb_path   = args.rgb   or os.path.join(pasta, "rgb_test.png")
+    depth_path = args.depth or os.path.join(pasta, "res_depth1.png")
 
     main(CONFIG, rgb_path, depth_path)
