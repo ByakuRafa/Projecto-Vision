@@ -2,20 +2,14 @@
 calculaCoordenada.py
 ====================
 Detecção de objetos por PROFUNDIDADE (depth map) — independente de cor.
+Padrão da Indústria: Fundo = Preto (0) | Próximo = Branco (Max)
 
 Lógica principal:
   1. O depth map revela a superfície da bancada como um plano de profundidade
-     uniforme (os pixels do "chão" concentram-se num valor próximo).
-  2. Objetos sobre a bancada ficam MAIS PRÓXIMOS da câmara → menor valor de depth.
+     uniforme (os pixels do "chão" concentram-se num valor próximo de preto/baixo).
+  2. Objetos sobre a bancada ficam MAIS PRÓXIMOS da câmara → maior valor de pixel (mais claro).
   3. Subtraindo o "chão" estimado, obtemos uma máscara de tudo que "sobressai".
   4. Encontramos contornos e calculamos X, Y, Z reais para cada objeto.
-
-Uso:
-  python calculaCoordenada.py [opções]
-
-  --rgb   <path>    Imagem RGB
-  --depth <path>    Depth map (PNG 8 ou 16 bit)
-  --help            Lista todos os parâmetros configuráveis
 """
 
 import cv2
@@ -24,43 +18,40 @@ import os
 import argparse
 
 # ==============================================================================
-# CONFIGURAÇÃO — edite aqui, ou passe argumentos via linha de comando
+# CONFIGURAÇÃO — Ajustada para Câmera a 1.07m e Foco de 50mm
 # ==============================================================================
 
 CONFIG = {
+    # ── Câmara (Propriedades ópticas atualizadas) ──────────────────────────
+    "focal_length_mm" : 24.0,   # Nova distância focal (Grande Angular)
+    "sensor_width_mm" : 36.0,   # Largura do sensor padrão Full Frame
 
-    # ── Câmara (bater com as propriedades da câmara no Blender) ────────────
-    "focal_length_mm" : 50.0,   # Lens > Focal Length
-    "sensor_width_mm" : 36.0,   # Lens > Sensor Width (padrão Blender = 36 mm)
-    "clip_start_m"    : 0.1,    # Camera > Clip Start (metros)
-    "clip_end_m"      : 10.0,   # Camera > Clip End   (metros)
+    # Mapeamento do Depth Map para metros (Padrão Indústria)
+    # Se o plano de fundo (chão) está a 1.5m, o Preto (0) = 1.5m.
+    # Se o objeto mais alto esperado tiver, por exemplo, 50cm de altura, 
+    # a distância dele até a lente será de 1.0m. Portanto, Branco (255) = 1.0m.
+    "clip_start_m"    : 1.00,   # Distância do ponto mais próximo aceitável (1.5m - 0.5m)
+    "clip_end_m"      : 1.50,   # Distância exata até o plano de fundo/mesa (base 0)
 
-    # ── Workbench (bancada real) ────────────────────────────────────────────
+    # ── Workbench (Dimensões físicas da área visível) ──────────────────────
     "workbench": {
-        "largura_m"  : 1.0,    # eixo X — largura da bancada
-        "profund_m"  : 0.6,    # eixo Y — profundidade da bancada
-        "volume_z_m" : 0.5,    # eixo Z — altura máxima de objetos
-        # Posição da câmara em relação ao canto frontal-esquerdo da bancada
-        "offset_x_m" : 0.5,    # metade da largura (câmara centralizada em X)
-        "offset_y_m" : 0.3,    # câmara deslocada para dentro em Y
-        "offset_z_m" : 0.8,    # câmara a 80 cm acima da superfície
+        # Com lente de 24mm a 1.5m de altura, a área visível real no chão é de 
+        # aproximadamente 2.25m de largura por 1.68m de profundidade.
+        "largura_m"  : 2.25,    # Eixo X — largura total visível
+        "profund_m"  : 1.68,    # Eixo Y — profundidade total visível
+        "volume_z_m" : 0.50,    # Eixo Z — altura máxima esperada dos objetos (50cm)
+        
+        # Posição da câmara em relação ao referencial (0,0,0) no canto da bancada
+        "offset_x_m" : 1.125,   # Câmera centralizada na largura (2.25 / 2)
+        "offset_y_m" : 0.84,    # Câmera centralizada na profundidade (1.68 / 2)
+        "offset_z_m" : 1.50,    # Altura real da câmera até a base zero (1.5m)
     },
 
-    # ── Detecção por depth ─────────────────────────────────────────────────
-    # O "chão" da bancada é estimado automaticamente pelo histograma do depth.
-    # "floor_percentile" define o percentil do histograma usado como referência
-    # da superfície (80 = o valor que 80% dos pixels não ultrapassam).
-    "floor_percentile"   : 80,
-
-    # Um pixel é considerado objeto se estiver este tanto de metros
-    # MAIS PRÓXIMO do que o chão estimado.
-    # Aumente se detectar ruído; diminua se perder objetos baixos.
-    "object_threshold_m" : 0.03,
-
-    # Filtros de contorno
-    "min_area_px"        : 500,   # área mínima em px² (filtra ruído)
-    "max_area_px"        : 0,     # 0 = sem limite máximo
-    "depth_patch_px"     : 4,     # raio da janela de mediana no depth (px)
+    "floor_percentile"   : 20,
+    "object_threshold_m" : 0.1, # 1 cm de tolerância para ignorar ruído
+    "min_area_px"        : 500,   
+    "max_area_px"        : 0,    
+    "depth_patch_px"     : 4,     
 }
 
 # ==============================================================================
@@ -78,10 +69,17 @@ def build_K(cfg, img_w, img_h):
 
 
 def raw_to_meters(depth_raw, img_depth, cfg):
-    """Converte valor bruto do pixel para metros (mapeamento linear Blender)."""
+    """
+    CORREÇÃO PADRÃO INDÚSTRIA:
+    Valor máximo (Branco) = clip_start_m (Perto)
+    Valor mínimo (Preto / 0) = clip_end_m (Longe)
+    """
     maxv = float(np.iinfo(img_depth.dtype).max) if np.issubdtype(img_depth.dtype, np.integer) else 1.0
     norm = np.asarray(depth_raw, dtype=np.float64) / maxv
-    return cfg["clip_start_m"] + norm * (cfg["clip_end_m"] - cfg["clip_start_m"])
+    
+    # Inversão da interpolação linear: quando norm=1 (branco), resulta em clip_start.
+    # Quando norm=0 (preto), resulta em clip_end.
+    return cfg["clip_end_m"] - norm * (cfg["clip_end_m"] - cfg["clip_start_m"])
 
 
 def pixel_to_3d(u, v, depth_m, K):
@@ -104,8 +102,8 @@ def cam_to_bench(Xc, Yc, Zc, wb):
 
 def estimate_floor_depth(depth_raw_gray, percentile):
     """
-    Estima o nível do 'chão' pelo percentil dominante do histograma do depth.
-    Valores altos de depth = longe = superfície da bancada.
+    Estima o nível do 'chão'. No padrão da indústria, valores baixos
+    (perto de 0/preto) representam o chão (mais distante).
     """
     flat = depth_raw_gray.flatten().astype(np.float64)
     return np.percentile(flat, percentile)
@@ -114,12 +112,6 @@ def estimate_floor_depth(depth_raw_gray, percentile):
 def depth_object_mask(depth_raw_gray, img_depth, cfg):
     """
     Retorna máscara onde pixels correspondem a objetos ACIMA da bancada.
-
-    Passos:
-      1. Converte depth bruto para metros
-      2. Estima profundidade do chão (percentil alto do histograma)
-      3. Pixels com depth < floor - threshold → objeto
-      4. Morfologia para limpar ruído e fechar buracos
     """
     depth_m    = raw_to_meters(depth_raw_gray.astype(np.float64), img_depth, cfg)
     floor_raw  = estimate_floor_depth(depth_raw_gray, cfg["floor_percentile"])
@@ -128,7 +120,8 @@ def depth_object_mask(depth_raw_gray, img_depth, cfg):
 
     print(f"  [Depth] Chão estimado: {floor_m:.4f} m  |  Threshold: {thresh_m:.3f} m")
 
-    # Pixels que estão mais próximos que (chão - threshold) = objetos
+    # CORREÇÃO: Objetos estão MAIS PERTO da câmera que o chão.
+    # Portanto, a distância métrica deles (depth_m) é MENOR que (floor_m - thresh_m)
     obj_mask = (depth_m < (floor_m - thresh_m)).astype(np.uint8) * 255
 
     # Morfologia: remove ruído pequeno e fecha buracos internos
@@ -168,7 +161,6 @@ def draw_depth_colormap(depth_raw_gray, mask, floor_m, cfg):
     """Visualização colorida do depth com máscara de objetos sobreposta."""
     norm = cv2.normalize(depth_raw_gray, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
     cmap = cv2.applyColorMap(norm, cv2.COLORMAP_TURBO)
-    # Borda branca nos objetos detectados
     contours_mask, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     cv2.drawContours(cmap, contours_mask, -1, (255, 255, 255), 2)
     return cmap
@@ -194,7 +186,7 @@ def main(cfg, rgb_path, depth_path):
     print(f"  Depth      : {depth_path}")
     print(f"{'='*62}\n")
 
-    # ── Carregar ───────────────────────────────────────────────────────────
+    # ── Carregar Imagens ───────────────────────────────────────────────────
     img_rgb   = cv2.imread(rgb_path)
     img_depth = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
 
@@ -206,26 +198,28 @@ def main(cfg, rgb_path, depth_path):
     h, w = img_rgb.shape[:2]
     print(f"  Resolução  : {w}×{h}   |   Depth dtype: {img_depth.dtype}\n")
 
-    # Depth deve ser escala de cinza
     depth_gray = img_depth if img_depth.ndim == 2 else cv2.cvtColor(img_depth, cv2.COLOR_BGR2GRAY)
 
-    # ── Câmara ─────────────────────────────────────────────────────────────
-    print("[Câmara]")
+    # ── Câmara e Parâmetros de Espaço ──────────────────────────────────────
+    print("[Câmara & Calibração]")
     K  = build_K(cfg, w, h)
     wb = cfg["workbench"]
+    print(f"  [Mesa] Altura de referência da câmera (Z_cam): {wb['offset_z_m']:.3f} m")
 
     # ── Segmentação por depth ───────────────────────────────────────────────
     print("\n[Segmentação por depth]")
     mask, floor_m = depth_object_mask(depth_gray, img_depth, cfg)
 
-    # ── Contornos ──────────────────────────────────────────────────────────
+    # ── Detecção de Contornos ──────────────────────────────────────────────
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     resultados   = []
     img_vis      = img_rgb.copy()
     max_area     = cfg["max_area_px"] if cfg["max_area_px"] > 0 else float("inf")
 
-    print("\n[Objetos detectados]")
+    print("\n" + "="*50)
+    print(" >>> TELEMETRIA E DEBUG DE OBJETOS (PADRÃO INDÚSTRIA) <<< ")
+    print("="*50)
 
     idx = 0
     for contour in sorted(contours, key=cv2.contourArea, reverse=True):
@@ -239,14 +233,18 @@ def main(cfg, rgb_path, depth_path):
         cX = int(M["m10"] / M["m00"])
         cY = int(M["m01"] / M["m00"])
 
-        # Mediana do depth na região do centróide
         r  = cfg["depth_patch_px"]
         y1, y2 = max(0, cY-r), min(h, cY+r+1)
         x1, x2 = max(0, cX-r), min(w, cX+r+1)
         med_raw = float(np.median(depth_gray[y1:y2, x1:x2]))
+        
+        # 1. Converte o pixel para metros usando a nova lógica inversa
         depth_m = float(raw_to_meters(med_raw, img_depth, cfg))
 
+        # 2. Projeta os pixels para o espaço 3D da câmera
         Xc, Yc, Zc     = pixel_to_3d(cX, cY, depth_m, K)
+        
+        # 3. Transforma para o referencial da mesa
         Xw, Yw, Zw     = cam_to_bench(Xc, Yc, Zc, wb)
         bx, by, bwpx, bhpx = cv2.boundingRect(contour)
 
@@ -262,27 +260,31 @@ def main(cfg, rgb_path, depth_path):
         }
         resultados.append(obj)
 
-        print(f"\n  Objeto #{idx+1}")
-        print(f"    Píxel       : ({cX}, {cY})   área={int(area)} px²")
-        print(f"    Depth       : {depth_m:.4f} m")
-        print(f"    Câmara      : X={Xc:.4f}  Y={Yc:.4f}  Z={Zc:.4f}")
-        print(f"    Bancada     : X={Xw:.4f}  Y={Yw:.4f}  Z={Zw:.4f}  ← enviar ao braço")
+        # ── BLOCO DE DEBUG DETALHADO ────────────────────────────────────────
+        print(f"\n 📦 DETECTADO: Objeto #{idx+1}")
+        print(f"    ├─ [Pixel] Centroide da Imagem   : U = {cX} px , V = {cY} px")
+        print(f"    ├─ [Depth Bruto] Valor do Pixel  : {med_raw:.1f} (Branco=Perto, Preto=Longe)")
+        print(f"    ├─ [Z_camera] Distância da Lente : {Zc:.4f} m (Medido da câmera até o topo do objeto)")
+        print(f"    ├─ [Equação] Altura do Objeto    : Z_mesa = Z_cam ({wb['offset_z_m']:.2f}m) - Z_camera ({Zc:.4f}m)")
+        print(f"    ├─ [ALTURA REAL DO CHÃO] (Z_w)   : {Zw:.4f} m  <─── ({Zw*100:.1f} cm de altura)")
+        print(f"    └─ [Coordenadas de Mesa]         : X_mesa = {Xw:.4f} m , Y_mesa = {Yw:.4f} m")
+        
         idx += 1
 
-    # ── Desenhar e exibir ──────────────────────────────────────────────────
+    print("="*50)
+
+    # ── Desenhar e exibir as telas ──────────────────────────────────────────
     draw_objects(img_vis, resultados)
     draw_hud(img_vis, wb, len(resultados), floor_m)
     depth_vis = draw_depth_colormap(depth_gray, mask, floor_m, cfg)
 
-    print(f"\n{'='*62}")
-    print(f"  Total: {len(resultados)} objeto(s) detectado(s)")
-    print(f"{'='*62}")
-    print("\n[COMANDOS BRAÇO ROBÓTICO]")
+    print(f"\nTotal: {len(resultados)} objeto(s) processado(s).")
+    print("\n[COMANDOS PRONTOS PARA O BRAÇO ROBÓTICO]")
     for obj in resultados:
         Xw, Yw, Zw = obj["workbench_m"]
-        print(f"  GOTO #{obj['id']}  X={Xw:.4f}  Y={Yw:.4f}  Z={Zw:.4f}")
+        print(f"  GOTO XYZ -> X:{Xw:+.4f}m, Y:{Yw:+.4f}m, Z:{Zw:+.4f}m")
 
-    cv2.imshow("RGB — Objetos Detectados", img_vis)
+    cv2.imshow("RGB - Objetos Detectados", img_vis)
     cv2.imshow("Depth Colormap + Mascara", depth_vis)
     cv2.imshow("Mascara de Objetos",       mask)
     cv2.waitKey(0)
@@ -296,7 +298,7 @@ def main(cfg, rgb_path, depth_path):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(
-        description="Detecta objetos por depth (independente de cor) e retorna coordenadas 3D.",
+        description="Detecta objetos por depth padrão indústria e retorna coordenadas 3D.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
@@ -345,7 +347,9 @@ if __name__ == "__main__":
     # Caminhos padrão
     base  = os.path.dirname(os.path.abspath(__file__))
     pasta = os.path.join(base, "test_depth")
-    rgb_path   = args.rgb   or os.path.join(pasta, "rgb_test.png")
-    depth_path = args.depth or os.path.join(pasta, "res_depth1.png")
+    rgb_path   = args.rgb   or os.path.join(pasta, "rgb_test_2.png")
+    #depth_path = args.depth or os.path.join(pasta, "blend_depth_2.png")
+    depth_path = args.depth or os.path.join(pasta, "deep_depth_2.png")
+    
 
     main(CONFIG, rgb_path, depth_path)
